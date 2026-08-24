@@ -2,6 +2,10 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased
+
+- Feature: `graphify extract --fallback-backend <B>` (or `GRAPHIFY_FALLBACK_BACKEND`; the flag wins) retries the semantic pass once on a second backend when every chunk fails on the primary, so a missing SDK package, a bad key, or an outage no longer costs the whole build; the retry covers exactly the still-uncached files, `--model` stays with the primary backend (the fallback runs on its own default model), a typo'd fallback name is rejected before any API spend, and only a zero-success retry keeps the all-chunks-failed exit 1.
+
 ## 0.9.57 (unreleased)
 
 - Fix: an incremental rebuild no longer wipes cross-file project AST nodes — re-extracting one `.csproj`/`.sln` was dropping package/framework nodes of a *referenced* project (whose stub carried the referenced file's `source_file`); the AST-replacement set is now derived from the files actually extracted (#3411, thanks @hopstreax).
