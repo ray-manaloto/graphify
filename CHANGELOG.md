@@ -2,6 +2,10 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased
+
+- Feature: `graphify extract --fallback-backend <B>` (or `GRAPHIFY_FALLBACK_BACKEND`; the flag wins) retries the semantic pass once on a second backend when every chunk fails on the primary, so a missing SDK package, a bad key, or an outage no longer costs the whole build; the retry covers exactly the still-uncached files, `--model` stays with the primary backend (the fallback runs on its own default model), a typo'd fallback name is rejected before any API spend, and only a zero-success retry keeps the all-chunks-failed exit 1.
+
 ## 0.9.53 (2026-08-30)
 
 - Fix: a batch of cross-language inheritance-edge corrections (thanks @Synvoya): JavaScript `class X extends Y` now emits an `inherits` edge (#1790); PHP interfaces, enums, and traits are captured as class-like nodes with their heritage (#1791); Scala `trait` declarations become class-like nodes (#1792) and qualified `extends`/`with` bases resolve to the tail type (#1794); a qualified Kotlin supertype resolves to its tail type instead of the package head (#1793); a C# interface extending an interface is classified as `inherits`, not `implements` (#1817); and a Go interface type-set constraint no longer emits a spurious `embeds` edge (#1818).
