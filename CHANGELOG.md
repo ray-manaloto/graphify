@@ -4,7 +4,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-- Feature: `graphify extract --fallback-backend <B>` (or `GRAPHIFY_FALLBACK_BACKEND`; the flag wins) retries the semantic pass once on a second backend when every chunk fails on the primary, so a missing SDK package, a bad key, or an outage no longer costs the whole build; the retry covers exactly the still-uncached files, `--model` stays with the primary backend (the fallback runs on its own default model), a typo'd fallback name is rejected before any API spend, and only a zero-success retry keeps the all-chunks-failed exit 1.
+- Feature: `graphify watch --semantic` runs LLM-backed semantic extraction automatically when doc/paper/image files change, instead of only writing the `needs_update` flag; the extract runs as a subprocess so it serializes on the per-repo rebuild lock (in-process re-entry would self-deadlock on `flock`), a failed extract still falls back to the flag + `/graphify --update` instruction, and a successful run clears the flag so no stale prompt is left behind. `--backend`/`--fallback-backend` are forwarded to the extract and rejected without `--semantic` rather than being a silent no-op.
 
 ## 0.9.48 (2026-08-20)
 
