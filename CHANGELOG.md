@@ -4,7 +4,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-- Feature: `graphify watch --semantic` runs LLM-backed semantic extraction automatically when doc/paper/image files change, instead of only writing the `needs_update` flag; the extract runs as a subprocess so it serializes on the per-repo rebuild lock (in-process re-entry would self-deadlock on `flock`), a failed extract still falls back to the flag + `/graphify --update` instruction, and a successful run clears the flag so no stale prompt is left behind. `--backend`/`--fallback-backend` are forwarded to the extract and rejected without `--semantic` rather than being a silent no-op.
+- Feature: `graphify export neo4j|falkordb --push` now sends nodes and edges in UNWIND batches (`--batch-size`, default 100) instead of one query per entry, so a remote push stops spending nearly all its time on round trips (~100x fewer for the default); rows are grouped by sanitized node label / relationship type first (those are baked into the Cypher text and cannot be parameters), the row payloads are exactly the old per-entry params, and UNWIND processes rows in order, so the MERGE/SET upsert semantics — including idempotent re-runs — are unchanged.
 
 ## 0.9.50 (2026-08-25)
 
