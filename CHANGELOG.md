@@ -2,6 +2,10 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased
+
+- Feature: `graphify extract --fallback-backend <B>` (or `GRAPHIFY_FALLBACK_BACKEND`; the flag wins) retries the semantic pass once on a second backend when every chunk fails on the primary, so a missing SDK package, a bad key, or an outage no longer costs the whole build; the retry covers exactly the still-uncached files, `--model` stays with the primary backend (the fallback runs on its own default model), a typo'd fallback name is rejected before any API spend, and only a zero-success retry keeps the all-chunks-failed exit 1.
+
 ## 0.9.50 (2026-08-25)
 
 - Fix: Ruby methods whose names end in `!`, `?`, or `=` now keep distinct node ids, so `save` and `save!` (or `foo` and `foo=`) no longer collide into one node; the label keeps the raw spelling and member-call resolution still matches (#3077, thanks @hopstreax).
