@@ -833,6 +833,109 @@ def _swift_pre_scan(root_node, source: bytes) -> tuple[set[str], set[str]]:
         stack.extend(n.children)
     return protocols, classes
 
+
+# ── Same-scope symbol-id collision pre-scan ────────────────────────────────
+#
+# make_id/normalize_id casefold and collapse repeated underscores (graphify/ids.py,
+# unchanged here — every other producer depends on that contract). That makes the
+# id space lossy: a private `_foo` beside its public `foo`, a class `Dropped`
+# beside a function `dropped`, or a top-level `_provider_plan` beside a
+# `Provider.plan` method all normalize to ONE id. `add_node`'s
+# `if nid in seen_ids: return` then silently drops every member after the
+# first — no warning, no trace of the lost declaration. Same failure class as
+# Go's case-only collision (#2779, graphify/extractors/go.py's `symbol_nid`):
+# node ids collapse information the source language keeps distinct. This scan
+# builds the collision groups so the main walk below can salt every member but
+# one, the same way the Go fix does — ids.py/normalize_id stay untouched, so
+# the id contract holds and non-colliding files (the overwhelming majority)
+# are byte-for-byte unaffected.
+
+def _prescan_function_name(node, config: LanguageConfig, source: bytes) -> str | None:
+    """Resolve a function/method declaration's name.
+
+    Mirrors the function_types branch of the main walk in `_extract_generic`
+    below (Swift deinit/subscript defaults, the C/C++ declarator path, the
+    plain name-field-with-fallback path) so a collision GROUP computed here
+    never disagrees with the id the main walk is about to emit. Kept as a
+    small, self-contained duplicate rather than a shared call so this
+    pre-scan cannot perturb that already-exercised code path.
+    """
+    if node.type == "deinit_declaration":
+        return "deinit"
+    if node.type == "subscript_declaration":
+        return "subscript"
+    if config.resolve_function_name_fn is not None:
+        declarator = node.child_by_field_name("declarator")
+        if declarator is None:
+            return None
+        return config.resolve_function_name_fn(declarator, source)
+    name_node = node.child_by_field_name(config.name_field)
+    if name_node is None:
+        for child in node.children:
+            if child.type in config.name_fallback_child_types:
+                name_node = child
+                break
+    return _read_text(name_node, source) if name_node else None
+
+
+def _prescan_class_name(node, config: LanguageConfig, source: bytes) -> str | None:
+    """Resolve a class-like declaration's name, mirroring the class_types branch
+    of the main walk (plain name-field-with-fallback — classes never go through
+    the C/C++ declarator or Swift deinit/subscript paths)."""
+    name_node = node.child_by_field_name(config.name_field)
+    if name_node is None:
+        for child in node.children:
+            if child.type in config.name_fallback_child_types:
+                name_node = child
+                break
+    return _read_text(name_node, source) if name_node else None
+
+
+def _collect_same_scope_symbol_collisions(
+    root_node, config: LanguageConfig, source: bytes, stem: str,
+) -> dict[str, set[str]]:
+    """Pre-scan a file for symbol ids that TWO OR MORE distinct declared names
+    would collapse onto (see module note above). Returns only the colliding
+    groups: id -> the set of distinct raw names that produced it.
+
+    Deliberately approximate, and safely so: scope is tracked through
+    ``config.class_types`` nesting only — not ``namespace_stack``, Ruby's
+    module-segment joining, or the C#/Swift-specific id paths elsewhere in
+    this file (partial classes, extensions, receiver-typed methods). A
+    collision inside one of those stays undetected, exactly today's already-
+    silent behavior for that narrower case — never a regression, since a miss
+    here always degrades to "no salting applied", not to a wrong or unstable
+    id. Nested (non-method) function definitions are not tracked as their own
+    scope: the main walk does not emit a node for a function nested inside
+    another function (a separate, documented gap), so there is nothing to
+    group there.
+    """
+    groups: dict[str, set[str]] = {}
+
+    def record(parent_id: str | None, name: str) -> str:
+        symbol_id = _make_id(parent_id, name) if parent_id else _make_id(stem, name)
+        groups.setdefault(symbol_id, set()).add(name)
+        return symbol_id
+
+    def walk(node, parent_id: str | None) -> None:
+        t = node.type
+        if t in config.class_types:
+            name = _prescan_class_name(node, config, source)
+            scope_id = record(parent_id, name) if name and normalize_id(name) else parent_id
+            for child in node.children:
+                walk(child, scope_id)
+            return
+        if t in config.function_types:
+            name = _prescan_function_name(node, config, source)
+            if name and normalize_id(name):
+                record(parent_id, name)
+            return
+        for child in node.children:
+            walk(child, parent_id)
+
+    walk(root_node, None)
+    return {sid: names for sid, names in groups.items() if len(names) > 1}
+
 def _swift_classify_base(name: str, kind: str | None, is_first: bool,
                           protocols: set[str], classes: set[str]) -> str:
     """Classify a Swift inheritance_specifier entry as `inherits` or `implements`."""
@@ -2899,6 +3002,35 @@ def _extract_generic(
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
 
+    # #4xxx: same-scope symbol-id collisions (see _collect_same_scope_symbol_collisions
+    # above). Computed once per file; empty for the overwhelming majority of files,
+    # in which case symbol_nid below is a no-op pass-through.
+    _symbol_collision_groups = _collect_same_scope_symbol_collisions(root, config, source, stem)
+
+    def symbol_nid(candidate_id: str, name: str) -> str:
+        """Disambiguate `candidate_id` if two or more distinct declared names in
+        this file's same scope would otherwise collapse onto it (see the
+        pre-scan above). The member whose name carries no leading/trailing
+        underscore keeps the plain id when it is the UNIQUE such member — that
+        is almost always the public/canonical symbol, and cross-file references
+        overwhelmingly target it, so keeping it stable avoids re-pointing edges
+        on an unrelated same-file edit. Every other member — and, when no
+        member is uniquely "clean" (e.g. a class `Dropped` beside a function
+        `dropped`), every member — is salted with a short deterministic hash of
+        its OWN name, so the result never depends on declaration order and a
+        salted id is reproducible across rebuilds without ever colliding with a
+        DIFFERENT scope's identically-salted sibling (the salt is appended to
+        the already scope-qualified `candidate_id`, not to a bare name).
+        """
+        names = _symbol_collision_groups.get(candidate_id)
+        if not names or len(names) < 2:
+            return candidate_id
+        clean = [n for n in names if n == n.strip("_.")]
+        if len(clean) == 1 and name == clean[0]:
+            return candidate_id
+        salt = hashlib.sha1(name.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
+        return _make_id(candidate_id, salt)
+
     def add_node(nid: str, label: str, line: int, *, node_type: str | None = None,
                  metadata: dict | None = None) -> None:
         if nid in seen_ids:
@@ -3025,7 +3157,7 @@ def _extract_generic(
             if config.ts_module == "tree_sitter_ruby":
                 ruby_segments = class_name.split("::")
                 class_name = "::".join(ruby_namespace + ruby_segments)
-            class_nid = _make_id(stem, ".".join(namespace_stack), class_name)
+            class_nid = symbol_nid(_make_id(stem, ".".join(namespace_stack), class_name), class_name)
             line = node.start_point[0] + 1
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp":
@@ -4093,11 +4225,11 @@ def _extract_generic(
 
             line = node.start_point[0] + 1
             if parent_class_nid:
-                func_nid = _make_id(parent_class_nid, func_name)
+                func_nid = symbol_nid(_make_id(parent_class_nid, func_name), func_name)
                 add_node(func_nid, f".{func_name}()", line)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
-                func_nid = _make_id(stem, func_name)
+                func_nid = symbol_nid(_make_id(stem, func_name), func_name)
                 add_node(func_nid, f"{func_name}()", line)
                 add_edge(file_nid, func_nid, "contains", line)
             callable_def_nids.add(func_nid)  # function / method def is callable
