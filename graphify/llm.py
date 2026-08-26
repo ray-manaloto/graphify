@@ -1833,36 +1833,178 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bo
     return result
 
 
-def _codex_disable_mcp_args(codex_cmd: str) -> list[str]:
-    """`-c mcp_servers.<name>.enabled=false` for every server Codex has configured.
+# In-process memoization for the openai-cli MCP-disable path. `codex mcp list
+# --json` alone measures ~1.25s on this machine, and a mixed-resolvability list
+# (some names resolve here, some don't) needs up to N+2 subprocess spawns to
+# sort out -- ~15s measured with 10 configured servers, 6 of them unresolvable.
+# `_codex_disable_mcp_args` runs once per `codex exec`, i.e. once per chunk, so
+# an unmemoized extraction pays that on every single chunk for an answer that
+# cannot change mid-run. Keyed on (codex_cmd, cwd[, names]) because premise P2
+# showed the SAME override for the SAME name resolves differently depending on
+# the working directory -- a cache blind to cwd would hand a later call an
+# answer derived somewhere else; the resolve cache additionally keys on the
+# name TUPLE so a listing that changes mid-process cannot replay a stale
+# verdict for a different set. Scoped to this process only: no disk, no
+# cross-process state, never invalidated within it -- entirely acceptable
+# because the MCP config a single `codex` install reports for a single cwd is
+# not expected to change over the life of one graphify run. Tests reset these
+# via monkeypatch; production code never clears them.
+_CODEX_MCP_NAMES_CACHE: dict[tuple[str, str], list[str]] = {}
+_CODEX_MCP_RESOLVE_CACHE: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
 
-    Extraction never calls a tool, and each configured MCP server is started per
-    `codex exec` invocation. Codex config overrides deep-merge, so a blanket
-    `-c mcp_servers={}` leaves the servers enabled; its per-server `enabled` field
-    (visible in `codex mcp get <name>`) is the switch that works. The server list
-    comes from `codex mcp list --json`, so no server name is hardcoded. Best effort:
-    if that call is unavailable (older Codex, no config), extraction proceeds with
-    whatever the user configured.
+
+def _codex_mcp_server_names(codex_cmd: str, cwd: str) -> list[str]:
+    """Every MCP server name `codex mcp list --json` reports for `cwd`, filtered
+    to the charset a bare TOML table key holds without quoting (alnum, `-`, `_`)
+    -- the same filter the disable-override path has always applied. Best
+    effort: a missing Codex, a non-zero exit, or unparsable JSON all return []
+    rather than raise, matching `codex mcp list`'s own failure posture.
+
+    Memoized per (codex_cmd, cwd) in `_CODEX_MCP_NAMES_CACHE` -- see the module
+    comment above it for why this is safe to never invalidate within a process.
     """
+    cache_key = (codex_cmd, cwd)
+    try:
+        cached = _CODEX_MCP_NAMES_CACHE[cache_key]
+    except KeyError:
+        cached = None
+    if cached is not None:
+        return cached
+
     import subprocess
 
     try:
         proc = subprocess.run(
             [codex_cmd, "mcp", "list", "--json"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30, check=False, **_no_window_kwargs(),
+            timeout=30, check=False, cwd=cwd, **_no_window_kwargs(),
         )
         if proc.returncode != 0 or not proc.stdout.strip():
-            return []
-        servers = json.loads(proc.stdout)
+            names: list[str] = []
+        else:
+            servers = json.loads(proc.stdout)
+            names = []
+            for entry in servers if isinstance(servers, list) else []:
+                name = (entry or {}).get("name") if isinstance(entry, dict) else None
+                if isinstance(name, str) and name and all(ch.isalnum() or ch in "-_" for ch in name):
+                    names.append(name)
     except Exception:
+        names = []
+
+    _CODEX_MCP_NAMES_CACHE[cache_key] = names
+    return names
+
+
+def _codex_resolvable_disable_args(codex_cmd: str, cwd: str, names: list[str]) -> list[str]:
+    """`-c mcp_servers.<name>.enabled=false` for every name in `names` Codex can
+    actually resolve for `cwd` -- reusable by any future `codex exec` call site
+    that has its own name list, not only the one below.
+
+    `codex mcp list --json` reporting a name is not the same as that name being a
+    `[mcp_servers.<name>]` table in any config Codex merges here: a plugin-provided
+    server, or one defined only in another repo's config, reports but resolves
+    nowhere. Overriding `.enabled` on a name with no real table creates one with
+    neither `command` nor `url`, and Codex rejects its ENTIRE bootstrap
+    configuration for that -- taking every other override down with it, and the
+    whole `codex exec` call with it. `disabled_reason` and `transport.type` from
+    the listing do not discriminate this: resolvability is a property of the
+    working directory, not of the server's own entry. The only honest check is
+    asking Codex, with the same lightweight subcommand (`mcp list --json`, no
+    model call) the caller already pays for -- never `codex exec`, never a read
+    of Codex's own config files.
+
+    One combined probe (every name at once) covers the common case -- everything
+    configured resolves here -- for the cost of one extra bounded subprocess call.
+    Only when that combined probe fails does this fall back to one probe per
+    remaining name, bounded by however many names Codex itself listed (single
+    digits to low tens in practice). Any uncertainty -- a probe that errors or
+    times out -- excludes that name rather than including it: failing to disable
+    an optimisation is always preferable to failing the run.
+
+    Per-name resolvability is not the same guarantee as resolvability of the
+    SET those survivors form together -- that is what gets returned, so that is
+    what gets validated: once the fallback has its candidate list, it probes
+    that exact list as a whole before emitting it, and returns [] rather than
+    an unvalidated list if the assembled set is rejected. This costs nothing
+    when nothing survived (there is nothing to validate) and nothing on the
+    combined-probe success path above (that list was already validated as a
+    whole by construction).
+
+    Memoized per (codex_cmd, cwd, tuple(names)) in `_CODEX_MCP_RESOLVE_CACHE` --
+    see the module comment above `_codex_mcp_server_names` for the scope and
+    invalidation policy this shares.
+    """
+    if not names:
         return []
-    args: list[str] = []
-    for entry in servers if isinstance(servers, list) else []:
-        name = (entry or {}).get("name") if isinstance(entry, dict) else None
-        if isinstance(name, str) and name and all(ch.isalnum() or ch in "-_" for ch in name):
-            args += ["-c", f"mcp_servers.{name}.enabled=false"]
-    return args
+
+    cache_key = (codex_cmd, cwd, tuple(names))
+    try:
+        cached = _CODEX_MCP_RESOLVE_CACHE[cache_key]
+    except KeyError:
+        cached = None
+    if cached is not None:
+        return cached
+
+    import subprocess
+
+    def _disable_args(candidates: list[str]) -> list[str]:
+        out: list[str] = []
+        for n in candidates:
+            out += ["-c", f"mcp_servers.{n}.enabled=false"]
+        return out
+
+    def _resolves(candidates: list[str]) -> bool:
+        try:
+            proc = subprocess.run(
+                [codex_cmd, "mcp", "list", "--json", *_disable_args(candidates)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30, check=False, cwd=cwd, **_no_window_kwargs(),
+            )
+        except Exception:
+            return False
+        return proc.returncode == 0
+
+    if _resolves(names):
+        result = _disable_args(names)
+    elif len(names) == 1:
+        # The combined probe above WAS the only probe possible for one name.
+        result = []
+    else:
+        # Each survivor here passed ALONE. That does not prove the SET they
+        # form together is accepted -- and the set is exactly what this
+        # function is about to hand back. Validate the assembled survivor
+        # list itself, once, before returning it: an unvalidated emission is
+        # the bug this whole function exists to prevent, reached by a longer
+        # route (individually-safe names whose combination Codex rejects).
+        # An empty survivor set has nothing to validate and costs no probe.
+        survivors = [n for n in names if _resolves([n])]
+        result = _disable_args(survivors) if survivors and _resolves(survivors) else []
+
+    _CODEX_MCP_RESOLVE_CACHE[cache_key] = result
+    return result
+
+
+def _codex_disable_mcp_args(codex_cmd: str) -> list[str]:
+    """`-c mcp_servers.<name>.enabled=false` for every server Codex has configured
+    AND can actually resolve for the current working directory.
+
+    Extraction never calls a tool, and each configured MCP server is started per
+    `codex exec` invocation. Codex config overrides deep-merge, so a blanket
+    `-c mcp_servers={}` leaves the servers enabled; its per-server `enabled` field
+    (visible in `codex mcp get <name>`) is the switch that works. The server list
+    comes from `codex mcp list --json`, so no server name is hardcoded. Best
+    effort, and the effort is wider than just "Codex is unavailable": if listing
+    fails, if a name cannot be confirmed resolvable, or if any probe this adds
+    errors, extraction proceeds with whatever the user configured for that name
+    rather than risking the whole call on an override that might not apply.
+
+    Both underlying lookups are memoized per (codex_cmd, cwd) for the life of
+    this process -- see `_CODEX_MCP_NAMES_CACHE` above -- so only the FIRST
+    `codex exec` in a run pays for the listing and the resolvability probes;
+    every later call in the same run and working directory returns instantly.
+    """
+    cwd = os.getcwd()
+    return _codex_resolvable_disable_args(codex_cmd, cwd, _codex_mcp_server_names(codex_cmd, cwd))
 
 
 def _call_openai_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bool = False, images: list[_ImageRef] | None = None) -> dict:
