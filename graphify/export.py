@@ -21,6 +21,44 @@ from graphify.paths import stem_filename_budget
 from graphify.exporters.graphdb import push_to_falkordb, push_to_neo4j  # noqa: E402,F401
 
 
+# Provenance strings emitted into graph.json (per-item `producers` records and
+# the run-level `extractor` block, #518 commit 1) are truncated at this length
+# — upstream #2140's own cap, ported as-is so this stays upstreamable.
+_MAX_PROVENANCE_STR = 256
+
+
+def _truncate_provenance(value: "str | None") -> "str | None":
+    if not isinstance(value, str):
+        return value
+    return value[:_MAX_PROVENANCE_STR]
+
+
+def _read_existing_extractor(existing_path: Path) -> "dict | None":
+    """Carry an `extractor` stamp forward across a write that ran no new
+    extraction of its own — e.g. `graphify label` re-clustering an
+    already-extracted graph. Without this, a relabel/cluster-only write
+    would silently wipe a real run's provenance stamp (#518 commit 1, spec
+    3c; ports upstream #2140's carry-forward).
+
+    Best-effort, mirroring the hyperedge-preservation read above in this
+    file: a missing, corrupt, or oversized existing file yields no
+    carry-forward rather than raising.
+    """
+    try:
+        if not existing_path.exists():
+            return None
+        from graphify.security import check_graph_file_size_cap
+        check_graph_file_size_cap(existing_path)
+        raw = json.loads(existing_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            block = raw.get("extractor")
+            if isinstance(block, dict):
+                return block
+    except Exception:
+        pass
+    return None
+
+
 # Artifacts worth preserving across rebuilds (non-regenerable without LLM or curation).
 _BACKUP_ARTIFACTS = [
     "graph.json",
@@ -263,7 +301,7 @@ def existing_graph_node_count(path: "str | Path"):
     return len(nodes) if isinstance(nodes, list) else MALFORMED_GRAPH
 
 
-def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None) -> bool:
+def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None, extractor: "dict | None" = None) -> bool:
     # Safety check: refuse to silently shrink an existing graph (#479)
     existing_path = Path(output_path)
     if not force and existing_path.exists():
@@ -405,6 +443,27 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     commit = built_at_commit if built_at_commit is not None else _git_head(Path(output_path).resolve().parent)
     if commit:
         data["built_at_commit"] = commit
+    # Run-level extraction provenance (#518 commit 1; field names match
+    # upstream #2140 so this stays upstreamable). `extractor=None` means the
+    # caller ran no new extraction this call (e.g. a relabel/cluster-only
+    # write) — carry the prior run's stamp forward instead of wiping it.
+    _extractor = extractor if extractor is not None else _read_existing_extractor(existing_path)
+    if _extractor:
+        _block: dict = {}
+        for _key in ("backend", "model", "mode", "graphify_version", "fork_commit"):
+            _val = _extractor.get(_key)
+            if _val:
+                _block[_key] = _truncate_provenance(_val)
+        if "executed" in _extractor:
+            _block["executed"] = bool(_extractor["executed"])
+        if "producers_complete" in _extractor:
+            _block["producers_complete"] = bool(_extractor["producers_complete"])
+        # This block is a RUN SUMMARY, not a per-source record (P2: a
+        # graph-level key cannot carry per-source provenance — see the
+        # per-item `producers` list instead). Omit it entirely on a plain
+        # AST run so graph.json stays byte-identical to before this change.
+        if _block.get("backend") or _block.get("model") or _block.get("mode"):
+            data["extractor"] = _block
     from graphify.paths import write_json_atomic
     # Atomic write: a crash/ENOSPC mid-write must not truncate a good graph.json.
     write_json_atomic(output_path, data, indent=2)

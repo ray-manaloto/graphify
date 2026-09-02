@@ -402,6 +402,39 @@ def _same_source_entity(survivor: dict, duplicate: dict) -> bool:
     return bool(keep_file) and keep_file == lose_file
 
 
+def _union_producers(a: "list | None", b: "list | None") -> list:
+    """Union two `producers` provenance lists, de-duplicated and sorted.
+
+    `producers` is a SET of "who touched this item" records, not a single
+    value, so it needs a union here — the opposite of the `_origin` exclusion
+    just below: inheriting a wrong `_origin` from a dropped record asserts a
+    falsehood, while unioning `producers` only ever adds true information
+    (#518 commit 1, spec 3b). De-dup key matches spec 3b's merge contract;
+    the sort keeps the result independent of merge order (#1851).
+    """
+    records: list[dict] = []
+    seen: set = set()
+    for group in (a, b):
+        if not isinstance(group, list):
+            continue
+        for rec in group:
+            if not isinstance(rec, dict):
+                continue
+            key = (
+                rec.get("backend"), rec.get("model_selector"),
+                rec.get("model_reported"), rec.get("effort"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(rec)
+    records.sort(key=lambda r: (
+        r.get("backend") or "", r.get("model_selector") or "",
+        r.get("model_reported") or "", r.get("effort") or "",
+    ))
+    return records
+
+
 def _merge_missing_attributes(survivor: dict, duplicate: dict) -> dict:
     """Fill the survivor's absent/None attributes from a same-source duplicate,
     without overriding values the survivor already has (#2091)."""
@@ -411,6 +444,13 @@ def _merge_missing_attributes(survivor: dict, duplicate: dict) -> dict:
         # _origin="ast" on an LLM survivor is read as an authority signal by the
         # ghost-merge (#2068) and watch deletion logic (#2091 review).
         if key == "_origin":
+            continue
+        if key == "producers":
+            # Union rather than fill-if-absent — see _union_producers above.
+            # A survivor that already has `producers` would otherwise silently
+            # discard the loser's, crediting the wrong source (#518 commit 1).
+            if value is not None or merged.get("producers") is not None:
+                merged["producers"] = _union_producers(merged.get("producers"), value)
             continue
         if value is None:
             continue
@@ -584,6 +624,13 @@ def deduplicate_entities(
         )
         for loser in same_source:
             survivor = _merge_missing_attributes(survivor, loser)
+        if "producers" in survivor and len(same_source) < len(losers):
+            # Some losers were excluded from the merge entirely — a different
+            # (or absent) source_file, per _same_source_entity — so their
+            # `producers` were never unioned in at all. The survivor's list
+            # cannot be complete (#518 commit 1, spec 3f / MISSING-1). Gated on
+            # "producers" already present so a pure-AST survivor is untouched.
+            survivor = dict(survivor, producers_complete=False)
         seen_ids[nid] = survivor
 
     for nid, losers in dropped.items():
@@ -801,6 +848,16 @@ def deduplicate_entities(
         ]
         winner = _pick_winner(group_nodes) if group_nodes else {"id": root}
         winner_id = winner["id"]
+        if len(group_nodes) > 1 and "producers" in winner:
+            # Exact/fuzzy label-merge losers are dropped WHOLE below
+            # (`deduped_nodes = [n for n in unique_nodes if n["id"] not in
+            # remap]`) — no attribute merge runs on this path at all, so any
+            # loser's `producers` is destroyed rather than unioned (#518
+            # commit 1, spec 3f; refutes an earlier claim that this path
+            # CREATES multi-producer items). Mutates the winner dict in
+            # place — it is a live reference into `unique_nodes`, which is
+            # what `deduped_nodes` below is filtered from.
+            winner["producers_complete"] = False
         for member in members:
             if member != winner_id:
                 remap[member] = winner_id

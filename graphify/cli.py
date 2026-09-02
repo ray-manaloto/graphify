@@ -7,6 +7,7 @@ import of main to avoid a cli<->__main__ import cycle.
 """
 from __future__ import annotations
 import json
+import logging
 import os
 import re
 import sys
@@ -83,6 +84,79 @@ _GEMINI_NUDGE_TEXT = (
 
 def _default_graph_path() -> str:
     return str(Path(_GRAPHIFY_OUT) / "graph.json")
+
+
+# Provenance strings (backend/model/effort identifiers, #518 commit 1) are
+# truncated at this length — mirrors export.py's _MAX_PROVENANCE_STR, itself
+# upstream #2140's cap. Not imported from export.py: this is the CLI's own
+# stamping surface, and duplicating one short constant beats importing across
+# a boundary that otherwise runs export-from-cli, never the reverse.
+_MAX_PROVENANCE_STR = 256
+
+
+def _truncate_provenance(value: "str | None") -> "str | None":
+    if not isinstance(value, str):
+        return value
+    return value[:_MAX_PROVENANCE_STR]
+
+
+def _resolve_model_selector(be: "str | None", requested: "str | None") -> str:
+    """The model string actually sent to backend `be` this call.
+
+    `requested` is the CLI's own `model` local, already scoped by the caller
+    to "only meaningful on the primary backend" (a fallback runs on its own
+    default model, not the primary's --model value). When nothing was
+    requested, resolve the backend's own default the same way llm.py does
+    (GRAPHIFY_OPENAI_CLI_MODEL / GRAPHIFY_CLAUDE_CLI_MODEL), so two runs at
+    different effective models are never stamped with the same string.
+    """
+    if requested:
+        return _truncate_provenance(requested)
+    if be in ("openai-cli", "openai"):
+        return _truncate_provenance(
+            os.environ.get("GRAPHIFY_OPENAI_CLI_MODEL", "").strip() or "gpt-5.6-sol"
+        )
+    if be in ("claude-cli", "claude"):
+        return _truncate_provenance(
+            os.environ.get("GRAPHIFY_CLAUDE_CLI_MODEL", "").strip() or "default"
+        )
+    return "default"
+
+
+def _stamp_producers(items: "list | None", *, backend: str, model_selector: str, effort: str) -> None:
+    """Stamp a `producers` provenance record onto every freshly-dispatched
+    semantic item, in place (#518 commit 1, spec 3a).
+
+    MUST run before `_save_semantic_cache` (spec MISSING-4): the semantic
+    cache stores no backend identity of its own, so a later cache hit can
+    only export the ORIGINAL backend's identity if it was written into the
+    item before that item was cached.
+
+    `model_reported` is always None here on purpose: the identity a
+    response actually carries (llm.py:1837 for claude-cli, always an echo
+    for openai-cli per llm.py:2130) is discarded before
+    `extract_corpus_parallel` returns to this call site, and threading it
+    through is out of scope for this commit (llm.py is not touched). None
+    is the honest value for what this layer can see — never fabricate it
+    as equal to model_selector.
+    """
+    if not items:
+        return
+    record = {
+        "backend": _truncate_provenance(backend),
+        "model_selector": model_selector,
+        "model_reported": None,
+        "effort": _truncate_provenance(effort),
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        existing = item.get("producers")
+        if isinstance(existing, list):
+            if record not in existing:
+                existing.append(record)
+        else:
+            item["producers"] = [record]
 
 
 def _stamped_manifest_files(
@@ -3472,6 +3546,27 @@ def dispatch_command(cmd: str) -> None:
             )
         if force:
             print("[graphify extract] --force: full re-scan, semantic cache reads skipped")
+            if not code_only:
+                # Gated on `not code_only` (#518 commit 1, spec 3d): --force
+                # --code-only explicitly preserves the semantic layer (the
+                # branch just above, #2923/#3125) and dispatches no semantic
+                # pass at all, so there is nothing cross-backend to warn
+                # about — kb-update and this fork's own census task run
+                # exactly that combination routinely, and an ungated warning
+                # would fire falsely on every one of those runs.
+                #
+                # Careful wording: this is NOT the same `force` as to_json's
+                # own `force=` kwarg (export.py), which DOES bypass the #479
+                # shrink guard — a reader who greps `force` in export.py must
+                # not be misled into thinking the two are one mechanism.
+                logging.getLogger(__name__).warning(
+                    "--force skips the semantic cache READ for this run "
+                    "(cache.py stores no backend identity), so a cache entry "
+                    "written by a different backend may be replaced without "
+                    "being archived. This is unrelated to to_json's own "
+                    "force= parameter (export.py), which bypasses the #479 "
+                    "shrink guard."
+                )
         elif incremental_mode and not manifest_path.exists():
             print(
                 "[graphify extract] manifest.json missing; using existing "
@@ -3923,6 +4018,10 @@ def dispatch_command(cmd: str) -> None:
         # (mirrors the #933 failed-chunk handling); captured below before the
         # _partial markers are stripped from the corpus.
         _partial_semantic_files: set[str] = set()
+        # False until a real dispatch is attempted below — a run served
+        # entirely from cache never flips this (#518 commit 1, spec 3c
+        # `executed`).
+        _semantic_executed = False
         sem_cache_hits = 0
         sem_cache_misses = 0
         # Deep mode uses its own namespace (cache/semantic-deep/) so deep and
@@ -3956,6 +4055,8 @@ def dispatch_command(cmd: str) -> None:
                 print(f"[graphify extract] semantic cache: {sem_cache_hits} hit / {sem_cache_misses} miss")
 
             if uncached_paths:
+                _semantic_executed = True
+
                 def _dispatch_semantic(
                     be: str, paths: list[str], *, last_resort: bool = True
                 ) -> tuple[dict, dict]:
@@ -4082,6 +4183,30 @@ def dispatch_command(cmd: str) -> None:
                         f"item(s) attributed to {len(_dropped_files)} file(s) not "
                         f"dispatched this run: {', '.join(sorted(_dropped_files))}"
                     )
+
+                # Stamp provenance BEFORE _save_semantic_cache below (spec
+                # MISSING-4) — the cache stores no backend of its own, so a
+                # later cache hit exports whichever backend's identity was
+                # written into the item before it was cached. `_last_backend`
+                # (not `backend`): they diverge under fallback (spec 3a).
+                _producer_effort = (
+                    os.environ.get("GRAPHIFY_OPENAI_CLI_EFFORT", "").strip() or "ultra"
+                )
+                _producer_model = _resolve_model_selector(
+                    _last_backend, model if _last_backend == backend else None
+                )
+                _stamp_producers(
+                    fresh.get("nodes"), backend=_last_backend,
+                    model_selector=_producer_model, effort=_producer_effort,
+                )
+                _stamp_producers(
+                    fresh.get("edges"), backend=_last_backend,
+                    model_selector=_producer_model, effort=_producer_effort,
+                )
+                _stamp_producers(
+                    fresh.get("hyperedges"), backend=_last_backend,
+                    model_selector=_producer_model, effort=_producer_effort,
+                )
                 # Which files truncated this run (item markers + the empty-parse
                 # _partial_files set). Computed BEFORE the save so it can be passed
                 # as partial_source_files: without it, a file whose only truncated
@@ -4544,6 +4669,30 @@ def dispatch_command(cmd: str) -> None:
         # passing --allow-partial (the good graph is preserved and the manifest
         # is not stamped, so the retry re-extracts).
         _force_write = cli_allow_partial or not _extraction_incomplete
+        # A semantic node with no `producers` at all is legacy — extracted
+        # before this stamp existed — and is counted, never backfilled: a
+        # fabricated provenance record is worse than an absent one (#518
+        # commit 1, spec 3e). Read-only scan; nothing here mutates G, so
+        # there is no risk of a legacy stamp reaching disk the way
+        # build.py's `_origin` setdefault does on the incremental path
+        # (spec MISSING-9 — deliberately not that shape).
+        _legacy_producer_nodes = sum(
+            1 for _, _d in G.nodes(data=True)
+            if _d.get("_origin") == "semantic" and "producers" not in _d
+        )
+        if _legacy_producer_nodes:
+            print(
+                f"[graphify extract] {_legacy_producer_nodes} semantic node(s) "
+                f"carry no producer provenance (extracted before this stamp "
+                f"existed); left as-is, not backfilled."
+            )
+        # Any node whose merge went through a lossy dedup path (spec 3f) is
+        # marked producers_complete=False; roll that up into the run-level
+        # extractor block below so a partial per-item list is never read as
+        # a full one.
+        _producers_incomplete = any(
+            _d.get("producers_complete") is False for _, _d in G.nodes(data=True)
+        )
         # Stamp provenance from the ANALYSED repo, not the shell's cwd: without
         # this, to_json's fallback asks `git rev-parse HEAD` in whatever repo the
         # command was invoked from, so `graphify extract <target>` run from
@@ -4553,8 +4702,39 @@ def dispatch_command(cmd: str) -> None:
         # cwd-anchoring mistake #2316 fixed for watch/update, surviving in the
         # extract path.
         from graphify.watch import _git_head as _gh_target
+        # Run-level `extractor` block (#518 commit 1, spec 3c; upstream #2140
+        # field names). `backend`/`model`/`extract_mode` are the existing
+        # pre-dispatch locals (the REQUESTED values), not `_last_backend` —
+        # this is a best-effort run summary, not the per-item authority the
+        # `producers` list is. Pass extractor=None (not a falsy dict) when
+        # this run touched no LLM backend at all and requested no --mode, so
+        # to_json's carry-forward preserves a prior run's real stamp instead
+        # of wiping it, and a plain AST run's graph.json stays byte-identical
+        # (spec criterion h).
+        _extractor_summary = None
+        if backend is not None or extract_mode is not None:
+            try:
+                import importlib.metadata as _im
+                _graphify_version = _im.version("graphifyy")
+            except Exception:
+                _graphify_version = None
+            _extractor_summary = {
+                "backend": backend,
+                "model": model,
+                "mode": extract_mode,
+                "graphify_version": _graphify_version,
+                # The git SHA of THIS graphify checkout (the running build),
+                # not the analysed repo's — `built_at_commit` above already
+                # covers that. Needed because graphify_version alone cannot
+                # distinguish this openai-cli fork from stock upstream at the
+                # same version string (spec MISSING-3).
+                "fork_commit": _gh_target(cwd=Path(__file__).resolve().parent),
+                "executed": _semantic_executed,
+                "producers_complete": not _producers_incomplete,
+            }
         _wrote = _to_json(G, communities, str(graph_json_path), force=_force_write,
-                          built_at_commit=_gh_target(cwd=Path(target).resolve()))
+                          built_at_commit=_gh_target(cwd=Path(target).resolve()),
+                          extractor=_extractor_summary)
         if not _wrote:
             # The shrink guard refused: this partial build is smaller than the
             # existing graph. Exit before writing the manifest/marker below, which
