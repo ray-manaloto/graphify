@@ -7,6 +7,7 @@ on:
 
 jobs:
   build-graph:
+    if: ${{ github.repository == 'Graphify-Labs/graphify' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write  # needed to upload release assets

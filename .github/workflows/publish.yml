@@ -21,6 +21,7 @@ permissions:
 
 jobs:
   publish:
+    if: ${{ github.repository == 'Graphify-Labs/graphify' }}
     name: Build and publish graphifyy
     runs-on: ubuntu-latest
     environment:

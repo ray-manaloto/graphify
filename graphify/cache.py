@@ -9,7 +9,7 @@ import re
 import tempfile
 import time
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 # Output directory name — override with GRAPHIFY_OUT env var for worktrees or
@@ -18,6 +18,12 @@ from pathlib import Path
 # (#1423); re-exported here as _GRAPHIFY_OUT for the existing call sites.
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 from graphify.paths import os_replace_with_fallback as _os_replace_with_fallback
+from graphify.raster import is_supported_raster_path
+from graphify.execution import (
+    execution_profile_fingerprint,
+    resolve_execution_profile,
+    validate_effective_managed_mode,
+)
 
 # AST cache entries are the output of graphify's own extractor code, so they
 # are only valid for the version that wrote them: keying purely on file
@@ -121,8 +127,9 @@ def prompt_fingerprint(prompt: "str | Path") -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()[:_PROMPT_FP_LEN]
 
 
-def _resolve_prompt_fp(prompt: "str | Path | None" = None,
-                       prompt_file: "str | Path | None" = None) -> str | None:
+def _resolve_prompt_fp(
+    prompt: "str | Path | None" = None, prompt_file: "str | Path | None" = None
+) -> str | None:
     """Fingerprint the caller's extraction prompt, or None when it supplied none.
 
     ``prompt`` is prompt TEXT; ``prompt_file`` is a path to a file CONTAINING the
@@ -187,7 +194,7 @@ def _body_content(content: bytes) -> bytes:
     # Slice right after the closing `---` (not after its line) so the output
     # stays byte-identical with the historical implementation for well-formed
     # frontmatter -- existing semantic-cache hashes must not churn.
-    return text[closer.start() + 3:].encode()
+    return text[closer.start() + 3 :].encode()
 
 
 # Stat-based index: maps absolute path → {size, mtime_ns, indexed_at_ns, ...}.
@@ -276,9 +283,11 @@ def _stat_entry_for(abs_key: str, st: "os.stat_result", observed_at_ns: int) -> 
     read — see :func:`_stat_sig_fresh` for why the ordering matters.
     """
     entry = _stat_index.get(abs_key)
-    if (not isinstance(entry, dict)
-            or entry.get("size") != st.st_size
-            or entry.get("mtime_ns") != st.st_mtime_ns):
+    if (
+        not isinstance(entry, dict)
+        or entry.get("size") != st.st_size
+        or entry.get("mtime_ns") != st.st_mtime_ns
+    ):
         entry = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
         _stat_index[abs_key] = entry
     entry["indexed_at_ns"] = observed_at_ns
@@ -418,6 +427,7 @@ def _flush_stat_index() -> None:
 def _normalize_path(path: Path) -> Path:
     """Normalize path for consistent cache keys across Windows path spellings."""
     import sys
+
     if sys.platform != "win32":
         return path
     s = str(path)
@@ -524,8 +534,8 @@ def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = No
         if not isinstance(hashes, dict):
             hashes = {}
             entry["hashes"] = hashes
-        hashes[salt] = digest       # preserve a co-located word_count / other salts
-        entry.pop("hash", None)     # retire the un-salted legacy digest
+        hashes[salt] = digest  # preserve a co-located word_count / other salts
+        entry.pop("hash", None)  # retire the un-salted legacy digest
         _stat_index_dirty = True
 
     return digest
@@ -730,7 +740,9 @@ def _id_anchor(path_str: str, rel_str: str) -> str:
     return full[: -len(suffix)] if full.endswith(suffix) else ""
 
 
-def _portability_anchors(path: "str | Path", root: "str | Path") -> tuple[list[str], str, list[str], str]:
+def _portability_anchors(
+    path: "str | Path", root: "str | Path"
+) -> tuple[list[str], str, list[str], str]:
     """Root forms to strip from / restore into one cache entry (#2257).
 
     Returns ``(id_anchors, id_restore, path_anchors, path_restore)``. The two
@@ -781,14 +793,16 @@ def _portability_anchors(path: "str | Path", root: "str | Path") -> tuple[list[s
         root_id_forms += (normalize_id(str(root)),)
     id_anchors = sorted(
         {a for a in (from_given, from_resolved, *root_id_forms) if a},
-        key=len, reverse=True,
+        key=len,
+        reverse=True,
     )
     # Only absolute roots may anchor a PATH value: a relative one ("corpus")
     # would also match a genuinely relative value that merely starts with the
     # same segment, and there is no way to tell the two apart on read.
     path_anchors = sorted(
         {s for s in (str(root_resolved), str(root)) if Path(s).is_absolute()},
-        key=len, reverse=True,
+        key=len,
+        reverse=True,
     )
     return id_anchors, id_restore, path_anchors, str(root_resolved)
 
@@ -805,9 +819,7 @@ def _rewrite_id_keyed_table_keys(payload: object, fn) -> None:
     ft = payload.get("objc_field_types") if isinstance(payload, dict) else None
     tables = ft.get("tables") if isinstance(ft, dict) else None
     if isinstance(tables, dict):
-        ft["tables"] = {
-            (fn(k) if isinstance(k, str) else k): v for k, v in tables.items()
-        }
+        ft["tables"] = {(fn(k) if isinstance(k, str) else k): v for k, v in tables.items()}
 
 
 def _rewrite_strings(obj: object, fn) -> None:
@@ -861,10 +873,10 @@ def _relativize_ids_in(payload: dict, path: "str | Path", root: Path) -> None:
                 return _ROOT_MARKER
             for sep in ("/", "\\"):
                 if value.startswith(a + sep):
-                    return _ROOT_MARKER + "/" + value[len(a) + 1:].replace("\\", "/")
+                    return _ROOT_MARKER + "/" + value[len(a) + 1 :].replace("\\", "/")
         for a in id_anchors:
             if value.startswith(a + "_"):
-                return _ROOT_MARKER + "_" + value[len(a) + 1:]
+                return _ROOT_MARKER + "_" + value[len(a) + 1 :]
         return value
 
     _rewrite_strings(payload, anchor)
@@ -886,7 +898,7 @@ def _absolutize_ids_in(payload: dict, path: "str | Path", root: Path) -> None:
     def restore(value: str) -> str:
         if not value.startswith(_ROOT_MARKER):
             return value
-        rest = value[len(_ROOT_MARKER):]
+        rest = value[len(_ROOT_MARKER) :]
         if not rest:
             return path_restore
         if rest[0] == "/":
@@ -930,8 +942,12 @@ def _absolutize_source_files_in(payload: dict, root: Path) -> None:
                     continue
 
 
-def cache_dir(root: Path = Path("."), kind: str = "ast",
-              prompt_fp: str | None = None) -> Path:
+def cache_dir(
+    root: Path = Path("."),
+    kind: str = "ast",
+    prompt_fp: str | None = None,
+    compatibility_fp: str | None = None,
+) -> Path:
     """Returns the cache directory for ``kind`` - creates it if needed.
 
     kind is "ast", "semantic", or a mode-namespaced semantic kind such as
@@ -958,15 +974,23 @@ def cache_dir(root: Path = Path("."), kind: str = "ast",
         _cleanup_stale_ast_entries(d.parent, d)
     elif prompt_fp:
         d = d / f"p{prompt_fp}"
+    if compatibility_fp:
+        d = d / f"x{compatibility_fp}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def load_cached(path: Path, root: Path = Path("."), kind: str = "ast",
-                cache_root: Path | None = None, prompt: "str | Path | None" = None,
-                prompt_file: "str | Path | None" = None,
-                allow_legacy: bool = True,
-                allow_partial: bool = False) -> dict | None:
+def load_cached(
+    path: Path,
+    root: Path = Path("."),
+    kind: str = "ast",
+    cache_root: Path | None = None,
+    prompt: "str | Path | None" = None,
+    prompt_file: "str | Path | None" = None,
+    allow_legacy: bool = True,
+    allow_partial: bool = False,
+    compatibility_fp: str | None = None,
+) -> dict | None:
     """Return cached extraction for this file if hash matches, else None.
 
     Cache key: SHA256 of file contents.
@@ -1004,9 +1028,9 @@ def load_cached(path: Path, root: Path = Path("."), kind: str = "ast",
     except OSError:
         return None
     prompt_fp = _resolve_prompt_fp(prompt, prompt_file)
-    entry = cache_dir(location, kind, prompt_fp) / f"{h}.json"
+    entry = cache_dir(location, kind, prompt_fp, compatibility_fp) / f"{h}.json"
     legacy_hit = False
-    if prompt_fp and not entry.exists() and allow_legacy:
+    if (prompt_fp or compatibility_fp) and not entry.exists() and allow_legacy:
         legacy = cache_dir(location, kind) / f"{h}.json"
         if legacy.exists():
             entry, legacy_hit = legacy, True
@@ -1043,6 +1067,7 @@ def load_cached(path: Path, root: Path = Path("."), kind: str = "ast",
             and isinstance(result, dict)
             and not result.get("nodes")
             and not result.get("hyperedges")
+            and not result.get("completed_empty")
         ):
             return None
         if (
@@ -1068,9 +1093,16 @@ def load_cached(path: Path, root: Path = Path("."), kind: str = "ast",
     return None
 
 
-def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "ast",
-                cache_root: Path | None = None, prompt: "str | Path | None" = None,
-                prompt_file: "str | Path | None" = None) -> None:
+def save_cached(
+    path: Path,
+    result: dict,
+    root: Path = Path("."),
+    kind: str = "ast",
+    cache_root: Path | None = None,
+    prompt: "str | Path | None" = None,
+    prompt_file: "str | Path | None" = None,
+    compatibility_fp: str | None = None,
+) -> None:
     """Save extraction result for this file.
 
     Stores as graphify-out/cache/{kind}/{hash}.json where hash = SHA256 of current file contents.
@@ -1113,6 +1145,7 @@ def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "a
     on_disk = result
     if isinstance(result, dict):
         import copy as _copy
+
         on_disk = _copy.deepcopy(result)
         _relativize_source_files_in(on_disk, root)
         # Then replace the absolute root inside the ids and remaining paths, so
@@ -1121,7 +1154,9 @@ def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "a
         _relativize_ids_in(on_disk, p, root)
     h = file_hash(p, root, cache_root=cache_root)
     location = cache_root if cache_root is not None else root
-    target_dir = cache_dir(location, kind, _resolve_prompt_fp(prompt, prompt_file))
+    target_dir = cache_dir(
+        location, kind, _resolve_prompt_fp(prompt, prompt_file), compatibility_fp
+    )
     entry = target_dir / f"{h}.json"
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=f"{h}.", suffix=".tmp")
     try:
@@ -1230,6 +1265,52 @@ def prune_semantic_cache(root: Path, live_hashes: set[str]) -> int:
     return pruned
 
 
+def _semantic_compatibility_fingerprint(
+    execution_profile: dict | None,
+    context: dict | None,
+    *,
+    effective_managed: bool,
+    mode: str | None,
+    prompt: "str | Path | None",
+    prompt_file: "str | Path | None",
+    attachment_fingerprint: str | None = None,
+) -> str | None:
+    if not effective_managed and attachment_fingerprint is None:
+        return None
+    base_fingerprint = None
+    if effective_managed:
+        if context is None:
+            raise ValueError("managed semantic cache requires run_context")
+        profile_fingerprint = None
+        if execution_profile is not None:
+            profile = resolve_execution_profile(
+                None, None, None, execution_profile=execution_profile, purpose="extract"
+            )
+            profile_fingerprint = execution_profile_fingerprint(profile)
+        payload = {
+            "schema_version": 1,
+            "mode": mode,
+            "profile": profile_fingerprint,
+            "prompt": _resolve_prompt_fp(prompt, prompt_file),
+            "extractor_identity": context["extractor_identity"],
+            "configuration_identity": context["configuration_identity"],
+            "instruction_identity": context["instruction_identity"],
+        }
+        base_fingerprint = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    if attachment_fingerprint is None:
+        return base_fingerprint
+    payload = {
+        "schema_version": 1,
+        "semantic_compatibility": base_fingerprint,
+        "raster_attachment": attachment_fingerprint,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def check_semantic_cache(
     files: list[str],
     root: Path = Path("."),
@@ -1237,6 +1318,11 @@ def check_semantic_cache(
     prompt: "str | Path | None" = None,
     prompt_file: "str | Path | None" = None,
     cache_root: "Path | None" = None,
+    *,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    cache_evidence_out: list[dict] | None = None,
+    attachment_compatibility: Mapping[str, str] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[str]]:
     """Check semantic extraction cache for a list of absolute file paths.
 
@@ -1274,17 +1360,57 @@ def check_semantic_cache(
     uncached: list[str] = []
     legacy_before = _legacy_semantic_hits
     corrupt_before = _corrupt_cache_entries
+    attachment_map = _normalize_attachment_compatibility(attachment_compatibility, root)
+    source_identity = _semantic_source_matcher(root)[0]
+    validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    if effective_managed and execution_profile is None:
+        # A capture-required context proves that execution must be managed, but
+        # it does not identify the backend/model/effort selectors.  Until the
+        # caller supplies a validated profile, no cache entry can prove it is
+        # compatible with the pending paid request.
+        return [], [], [], list(files)
 
     for fpath in files:
         p = Path(fpath)
         if not p.is_absolute():
             p = Path(root) / p
-        result = load_cached(p, root, kind=kind, cache_root=cache_root,
-                             prompt=prompt, prompt_file=prompt_file)
+        attachment_fp = None
+        if attachment_map is not None:
+            attachment_fp = attachment_map.get(source_identity(p))
+            if is_supported_raster_path(p) and attachment_fp is None:
+                uncached.append(fpath)
+                continue
+        compatibility_fp = _semantic_compatibility_fingerprint(
+            execution_profile,
+            validated_context,
+            effective_managed=effective_managed,
+            mode=mode,
+            prompt=prompt,
+            prompt_file=prompt_file,
+            attachment_fingerprint=attachment_fp,
+        )
+        result = load_cached(
+            p,
+            root,
+            kind=kind,
+            cache_root=cache_root,
+            prompt=prompt,
+            prompt_file=prompt_file,
+            allow_legacy=not effective_managed and attachment_fp is None,
+            compatibility_fp=compatibility_fp,
+        )
         if result is not None:
             cached_nodes.extend(result.get("nodes", []))
             cached_edges.extend(result.get("edges", []))
             cached_hyperedges.extend(result.get("hyperedges", []))
+            if cache_evidence_out is not None and (
+                effective_managed or attachment_fp is not None
+            ):
+                provenance = result.get("_cache_provenance")
+                if isinstance(provenance, dict):
+                    cache_evidence_out.append(provenance)
         else:
             uncached.append(fpath)
 
@@ -1376,6 +1502,33 @@ def _semantic_source_matcher(
     return source_identity, normalize_value
 
 
+def _normalize_attachment_compatibility(
+    value: Mapping[str, str] | None,
+    root: Path,
+) -> dict[Path, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("attachment_compatibility must be a mapping")
+    source_identity, _normalize_value = _semantic_source_matcher(root)
+    normalized: dict[Path, str] = {}
+    for raw_path, fingerprint in value.items():
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("attachment_compatibility paths must be nonempty strings")
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in fingerprint)
+        ):
+            raise ValueError("attachment_compatibility values must be lowercase SHA-256 digests")
+        identity = source_identity(raw_path)
+        prior = normalized.get(identity)
+        if prior is not None and prior != fingerprint:
+            raise ValueError("attachment_compatibility contains conflicting path identities")
+        normalized[identity] = fingerprint
+    return normalized
+
+
 def save_semantic_cache(
     nodes: list[dict],
     edges: list[dict],
@@ -1388,6 +1541,11 @@ def save_semantic_cache(
     prompt_file: "str | Path | None" = None,
     partial_source_files: Iterable[str | Path] | None = None,
     cache_root: "Path | None" = None,
+    *,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    producer_receipt: dict | list[dict] | None = None,
+    attachment_compatibility: Mapping[str, str] | None = None,
 ) -> int:
     """Save semantic extraction results to cache, keyed by source_file.
 
@@ -1440,7 +1598,23 @@ def save_semantic_cache(
     from collections import defaultdict
 
     kind = "semantic" if mode is None else f"semantic-{mode}"
+    validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    producer_receipts: list[dict] = []
+    if producer_receipt is not None:
+        candidates = producer_receipt if isinstance(producer_receipt, list) else [producer_receipt]
+        if not all(isinstance(item, dict) and item.get("receipt_id") for item in candidates):
+            raise ValueError("producer_receipt entries must contain receipt_id")
+        producer_receipts = list(candidates)
+    if effective_managed and not producer_receipts:
+        raise ValueError("managed semantic cache writes require producer_receipt")
+    if effective_managed and execution_profile is None:
+        # Retain the caller-owned run receipt, but do not create a reusable
+        # paid-work cache record without backend/model/effort compatibility.
+        return 0
     source_path, _normalize_value = _semantic_source_matcher(root)
+    attachment_map = _normalize_attachment_compatibility(attachment_compatibility, root)
 
     def _normalized(item: dict) -> dict:
         """Copy of ``item`` with a portable ``source_file`` (#2197).
@@ -1471,7 +1645,7 @@ def save_semantic_cache(
         src = e.get("source_file", "")
         if src:
             by_file[src]["edges"].append(e)
-    for h in (hyperedges or []):
+    for h in hyperedges or []:
         h = _normalized(h)
         src = h.get("source_file", "")
         if src:
@@ -1489,6 +1663,11 @@ def save_semantic_cache(
     allowed_paths = None
     if allowed_source_files is not None:
         allowed_paths = {source_path(path) for path in allowed_source_files}
+        if producer_receipts and all(
+            item.get("completion") == "completed_empty" for item in producer_receipts
+        ):
+            for path in allowed_paths:
+                by_file[str(path)]
 
     def _recover_group_path(fpath: str) -> tuple[Path, Path]:
         """Return ``(cache_path, resolved_path)`` for one ``by_file`` group,
@@ -1528,6 +1707,17 @@ def save_semantic_cache(
         for _pp in partial_paths:
             if _pp not in _present:
                 by_file[str(_pp)]  # defaultdict: create an empty {nodes,edges,hyperedges}
+
+    if attachment_map is not None:
+        missing_attachments = sorted(
+            fpath
+            for fpath in by_file
+            if is_supported_raster_path(fpath) and _recover_group_path(fpath)[0] not in attachment_map
+        )
+        if missing_attachments:
+            raise ValueError(
+                "raster semantic cache writes require attachment compatibility for every image"
+            )
 
     def group_skipped(fpath: str) -> bool:
         """Mirror the write-loop skip condition for one source_file group."""
@@ -1583,14 +1773,22 @@ def save_semantic_cache(
                 if group_skipped(fpath):
                     continue
                 result["edges"] = [e for e in result["edges"] if not edge_dangles(e)]
-                result["hyperedges"] = [
-                    h for h in result["hyperedges"] if not hyperedge_dangles(h)
-                ]
+                result["hyperedges"] = [h for h in result["hyperedges"] if not hyperedge_dangles(h)]
 
     saved = 0
     skipped_not_file = 0
     for fpath, result in by_file.items():
         cache_path, p = _recover_group_path(fpath)
+        attachment_fp = attachment_map.get(cache_path) if attachment_map is not None else None
+        compatibility_fp = _semantic_compatibility_fingerprint(
+            execution_profile,
+            validated_context,
+            effective_managed=effective_managed,
+            mode=mode,
+            prompt=prompt,
+            prompt_file=prompt_file,
+            attachment_fingerprint=attachment_fp,
+        )
         if p.is_file():
             if cache_path != source_path(fpath):
                 # #2973: recovery only redirected the WRITE KEY. Each item in
@@ -1618,6 +1816,7 @@ def save_semantic_cache(
                     stacklevel=2,
                 )
                 continue
+            prev = None
             if merge_existing:
                 # allow_legacy=False: merging a pre-fingerprint entry into this
                 # write would fuse two prompt vintages inside a single entry and
@@ -1630,9 +1829,17 @@ def save_semantic_cache(
                 # markers ride through, so is_partial below re-detects it) rather
                 # than a later clean slice silently replacing it and promoting the
                 # half-file to complete.
-                prev = load_cached(cache_path, root, kind=kind, cache_root=cache_root,
-                                   prompt=prompt, prompt_file=prompt_file,
-                                   allow_legacy=False, allow_partial=True)
+                prev = load_cached(
+                    cache_path,
+                    root,
+                    kind=kind,
+                    cache_root=cache_root,
+                    prompt=prompt,
+                    prompt_file=prompt_file,
+                    allow_legacy=False,
+                    allow_partial=True,
+                    compatibility_fp=compatibility_fp,
+                )
                 _prev_partial = bool(prev.get("partial")) if prev else False
                 if prev:
                     result = {
@@ -1654,16 +1861,61 @@ def save_semantic_cache(
                 (partial_paths is not None and cache_path in partial_paths)
                 or _group_has_partial_marker(result)
                 or _prev_partial
+                or any(
+                    receipt.get("completion") not in {"completed", "completed_empty"}
+                    for receipt in producer_receipts
+                )
             )
             if is_partial:
                 result = {**result, "partial": True}
             # A semantic extraction with zero nodes and zero hyperedges is not a valid
             # standalone extraction (#2927): edge-only or empty results must not be
             # cached, so that subsequent runs can re-dispatch and retry the file (#933/#1666).
-            if not is_partial and not (result.get("nodes") or result.get("hyperedges")):
+            completed_empty = bool(
+                producer_receipts
+                and all(item.get("completion") == "completed_empty" for item in producer_receipts)
+            )
+            if (
+                not is_partial
+                and not completed_empty
+                and not (result.get("nodes") or result.get("hyperedges"))
+            ):
                 continue
-            save_cached(cache_path, result, root, kind=kind, cache_root=cache_root,
-                        prompt=prompt, prompt_file=prompt_file)
+            if compatibility_fp:
+                prior_receipts = []
+                if prev:
+                    prior = prev.get("_cache_provenance") or {}
+                    prior_receipts = prior.get("producer_receipts") or []
+                unique_receipts: list[dict] = []
+                seen_receipts: set[str] = set()
+                for receipt in [*prior_receipts, *producer_receipts]:
+                    receipt_id = receipt.get("receipt_id")
+                    if receipt_id not in seen_receipts:
+                        seen_receipts.add(receipt_id)
+                        unique_receipts.append(receipt)
+                result = {
+                    **result,
+                    "completed_empty": completed_empty,
+                    "_cache_provenance": {
+                        "compatibility_fingerprint": compatibility_fp,
+                        "producer_receipts": unique_receipts,
+                        **(
+                            {"attachment_compatibility_fingerprint": attachment_fp}
+                            if attachment_fp is not None
+                            else {}
+                        ),
+                    },
+                }
+            save_cached(
+                cache_path,
+                result,
+                root,
+                kind=kind,
+                cache_root=cache_root,
+                prompt=prompt,
+                prompt_file=prompt_file,
+                compatibility_fp=compatibility_fp,
+            )
             saved += 1
         else:
             skipped_not_file += 1
