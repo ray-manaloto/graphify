@@ -399,6 +399,12 @@ def test_capture_required_without_profile_uses_managed_runner_and_retains_receip
         "_codex_disable_mcp_args",
         lambda *_args: pytest.fail("capture-required call must not probe native MCP state"),
     )
+    real_which = shutil.which
+    monkeypatch.setattr(
+        execution.shutil,
+        "which",
+        lambda name: "/test-bin/codex" if name == "codex" else real_which(name),
+    )
     result = llm._call_openai_cli(
         "prompt",
         prepared_attachments=[attachment],
