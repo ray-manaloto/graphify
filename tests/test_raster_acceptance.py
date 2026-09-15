@@ -18,6 +18,17 @@ from graphify import execution, llm, raster
 _RASTER_FIXTURE = Path(__file__).parent / "fixtures/raster/alpha.png"
 
 
+@pytest.fixture
+def synthetic_cli_binaries(monkeypatch):
+    real_which = shutil.which
+    synthetic = {"codex": "/test-bin/codex", "claude": "/test-bin/claude"}
+    monkeypatch.setattr(
+        execution.shutil,
+        "which",
+        lambda name: synthetic.get(name) or real_which(name),
+    )
+
+
 def _run_extract(
     monkeypatch,
     corpus: Path,
@@ -234,7 +245,9 @@ def test_managed_claude_relative_raster_uses_staged_prompt_and_add_dir(monkeypat
     assert result["_execution_receipts"][0]["receipt_id"] == receipts[0]["receipt_id"]
 
 
-def test_zero_success_fallback_reuses_original_raster_stage(monkeypatch, tmp_path):
+def test_zero_success_fallback_reuses_original_raster_stage(
+    synthetic_cli_binaries, monkeypatch, tmp_path
+):
     corpus = tmp_path / "corpus"
     corpus.mkdir()
     source = corpus / "valid.png"
@@ -288,7 +301,9 @@ def test_zero_success_fallback_reuses_original_raster_stage(monkeypatch, tmp_pat
     assert fallback[0]["original_source"] == primary[0]["original_source"]
 
 
-def test_zero_success_fallback_rejects_source_change_without_restaging(monkeypatch, tmp_path):
+def test_zero_success_fallback_rejects_source_change_without_restaging(
+    synthetic_cli_binaries, monkeypatch, tmp_path
+):
     corpus = tmp_path / "corpus"
     corpus.mkdir()
     source = corpus / "valid.png"
