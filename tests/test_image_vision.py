@@ -8,26 +8,30 @@ backends whose model can see them.
 Every backend is mocked (fake SDK module / subprocess), so the suite runs on CI
 with no API keys, no network, and no `claude` binary.
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from graphify import llm
+from graphify import llm, raster
 
-# A 1x1 PNG is unnecessary — the renderers never decode pixels, they only base64
-# the bytes — so any non-empty byte string stands in for image content.
-_PNG_BYTES = b"\x89PNG\r\n\x1a\nFAKEPIXELDATA"
-_NODE_JSON = json.dumps({
-    "nodes": [{"id": "x", "label": "L", "file_type": "image", "source_file": "a.png"}],
-    "edges": [],
-    "hyperedges": [],
-})
+# Shared raster admission now decodes inputs before any backend call, so the
+# renderer fixture must also be a valid image rather than signature-only bytes.
+_PNG_BYTES = (Path(__file__).parent / "fixtures/raster/alpha.png").read_bytes()
+_NODE_JSON = json.dumps(
+    {
+        "nodes": [{"id": "x", "label": "L", "file_type": "image", "source_file": "a.png"}],
+        "edges": [],
+        "hyperedges": [],
+    }
+)
 
 
 def _make_corpus(tmp_path):
@@ -44,6 +48,7 @@ def _make_corpus(tmp_path):
 
 # ── pure helpers ──────────────────────────────────────────────────────────────
 
+
 def test_pdf_routed_through_pypdf_not_readtext(tmp_path, monkeypatch):
     # A PDF is binary; reading it as text yields garbage (the bug). It must be
     # routed through the pypdf extractor, and the raw bytes must never reach the
@@ -51,6 +56,7 @@ def test_pdf_routed_through_pypdf_not_readtext(tmp_path, monkeypatch):
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4 RAWBINARYGARBAGE\x00\xff")
     import graphify.detect as detect
+
     monkeypatch.setattr(detect, "extract_pdf_text", lambda p: "EXTRACTED PDF TEXT")
     out = llm._read_files([pdf], tmp_path)
     assert "EXTRACTED PDF TEXT" in out
@@ -135,7 +141,7 @@ def test_path_backend_skips_byte_read_and_size_cap(tmp_path, monkeypatch):
     big.write_bytes(b"x" * 64)
     monkeypatch.setattr(llm, "_MAX_IMAGE_BYTES", 8)
     (ref,) = llm._build_image_refs([big], tmp_path, read_bytes=False)
-    assert ref.raw is None              # never read
+    assert ref.raw is None  # never read
     assert ref.rel == "huge.png" and ref.path.name == "huge.png"  # path still usable
 
 
@@ -154,8 +160,10 @@ def test_claude_cli_passes_oversized_image_by_path(tmp_path, monkeypatch):
         return MagicMock(returncode=0, stdout=json.dumps(envelope), stderr="")
 
     monkeypatch.setattr(llm, "_response_is_hollow", lambda r, p: False)
-    with patch("shutil.which", return_value="/fake/claude"), \
-         patch("subprocess.run", side_effect=fake_run):
+    with (
+        patch("shutil.which", return_value="/fake/claude"),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
         llm._call_claude_cli("CORPUS", images=refs)
     assert str(refs[0].path) in seen["input"]
 
@@ -193,6 +201,7 @@ def test_chunk_packing_caps_images_per_chunk(tmp_path):
 
 # ── content builders ──────────────────────────────────────────────────────────
 
+
 def test_anthropic_content_has_base64_block(tmp_path):
     img, _, _ = _make_corpus(tmp_path)
     refs = llm._build_image_refs([img], tmp_path)
@@ -200,7 +209,9 @@ def test_anthropic_content_has_base64_block(tmp_path):
     assert isinstance(content, list)
     assert content[0]["type"] == "image"
     assert content[0]["source"] == {
-        "type": "base64", "media_type": "image/png", "data": refs[0].b64,
+        "type": "base64",
+        "media_type": "image/png",
+        "data": refs[0].b64,
     }
     assert content[-1]["type"] == "text" and "CORPUS" in content[-1]["text"]
 
@@ -242,6 +253,7 @@ def test_no_images_is_byte_identical(tmp_path):
 
 # ── fake SDK modules ──────────────────────────────────────────────────────────
 
+
 def _fake_anthropic(monkeypatch, captured):
     class _Messages:
         def create(self, **kw):
@@ -251,6 +263,7 @@ def _fake_anthropic(monkeypatch, captured):
                 usage=SimpleNamespace(input_tokens=5, output_tokens=7),
                 stop_reason="end_turn",
             )
+
     mod = types.ModuleType("anthropic")
     mod.Anthropic = lambda **kw: SimpleNamespace(messages=_Messages())
     monkeypatch.setitem(sys.modules, "anthropic", mod)
@@ -261,10 +274,14 @@ def _fake_openai(monkeypatch, captured):
         def create(self, **kw):
             captured.update(kw)
             return SimpleNamespace(
-                choices=[SimpleNamespace(
-                    message=SimpleNamespace(content=_NODE_JSON), finish_reason="stop")],
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=_NODE_JSON), finish_reason="stop"
+                    )
+                ],
                 usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4),
             )
+
     mod = types.ModuleType("openai")
     mod.OpenAI = lambda **kw: SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
     monkeypatch.setitem(sys.modules, "openai", mod)
@@ -314,6 +331,7 @@ def _fake_boto3(monkeypatch, captured):
 
 # ── backend payload shape (mocked) ────────────────────────────────────────────
 
+
 def test_call_claude_sends_image_block(tmp_path, monkeypatch):
     img, _, _ = _make_corpus(tmp_path)
     refs = llm._build_image_refs([img], tmp_path)
@@ -357,6 +375,7 @@ def test_call_bedrock_sends_raw_image_bytes(tmp_path, monkeypatch):
 # reasoning-capable model emits reasoningContent ahead of the answer. Selection
 # must key on block shape, not position, or those models yield no text at all.
 
+
 def _bedrock_resp(blocks: list) -> dict:
     return {"output": {"message": {"content": blocks}}}
 
@@ -367,31 +386,39 @@ def test_bedrock_response_text_single_text_block_unchanged():
 
 
 def test_bedrock_response_text_skips_leading_reasoning_block():
-    resp = _bedrock_resp([
-        {"reasoningContent": {"reasoningText": {"text": "deliberating"}}},
-        {"text": _NODE_JSON},
-    ])
+    resp = _bedrock_resp(
+        [
+            {"reasoningContent": {"reasoningText": {"text": "deliberating"}}},
+            {"text": _NODE_JSON},
+        ]
+    )
     assert llm._bedrock_response_text(resp, default="{}") == _NODE_JSON
 
 
-@pytest.mark.parametrize("leading", [
-    {"reasoningContent": {}},
-    {"toolUse": {"name": "x", "input": {}}},
-    {"someFutureBlockType": {"a": 1}},
-    {"text": "   "},
-])
+@pytest.mark.parametrize(
+    "leading",
+    [
+        {"reasoningContent": {}},
+        {"toolUse": {"name": "x", "input": {}}},
+        {"someFutureBlockType": {"a": 1}},
+        {"text": "   "},
+    ],
+)
 def test_bedrock_response_text_skips_non_text_leading_blocks(leading):
     resp = _bedrock_resp([leading, {"text": _NODE_JSON}])
     assert llm._bedrock_response_text(resp, default="{}") == _NODE_JSON
 
 
-@pytest.mark.parametrize("resp", [
-    {"output": {"message": {"content": []}}},
-    {"output": {"message": {"content": [{"reasoningContent": {}}]}}},
-    {"output": {"message": {"content": "not-a-list"}}},
-    {"output": {}},
-    {},
-])
+@pytest.mark.parametrize(
+    "resp",
+    [
+        {"output": {"message": {"content": []}}},
+        {"output": {"message": {"content": [{"reasoningContent": {}}]}}},
+        {"output": {"message": {"content": "not-a-list"}}},
+        {"output": {}},
+        {},
+    ],
+)
 def test_bedrock_response_text_falls_back_without_text(resp):
     assert llm._bedrock_response_text(resp, default="SENTINEL") == "SENTINEL"
 
@@ -462,17 +489,23 @@ def test_call_claude_parses_thinking_model_response(tmp_path, monkeypatch):
 
 def test_call_bedrock_parses_reasoning_model_response(monkeypatch):
     """End-to-end: a reasoning-model response must not look hollow."""
+
     def _fake(monkeypatch):
         class _Client:
             def converse(self, **kw):
                 return {
-                    "output": {"message": {"content": [
-                        {"reasoningContent": {"reasoningText": {"text": "think"}}},
-                        {"text": _NODE_JSON},
-                    ]}},
+                    "output": {
+                        "message": {
+                            "content": [
+                                {"reasoningContent": {"reasoningText": {"text": "think"}}},
+                                {"text": _NODE_JSON},
+                            ]
+                        }
+                    },
                     "usage": {"inputTokens": 1, "outputTokens": 2},
                     "stopReason": "end_turn",
                 }
+
         boto3 = types.ModuleType("boto3")
         boto3.Session = lambda **kw: SimpleNamespace(client=lambda svc, **kwargs: _Client())
         monkeypatch.setitem(sys.modules, "boto3", boto3)
@@ -492,6 +525,8 @@ def test_call_bedrock_parses_reasoning_model_response(monkeypatch):
     assert len(result["nodes"]) == 1
     # Hard-indexing block 0 yielded "{}" -> zero nodes -> relabelled "length".
     assert result["finish_reason"] == "stop"
+
+
 def test_call_bedrock_honors_api_timeout(monkeypatch):
     # GRAPHIFY_API_TIMEOUT must reach the botocore client's read_timeout; else
     # Converse falls back to botocore's 60s default and a long generation dies
@@ -521,7 +556,6 @@ def test_call_bedrock_api_timeout_defaults_when_unset(monkeypatch):
 # ── CLI backends (mocked subprocess) ──────────────────────────────────────────
 
 
-
 def test_claude_cli_adds_dir_and_read_instruction(tmp_path, monkeypatch):
     img, _, _ = _make_corpus(tmp_path)
     refs = llm._build_image_refs([img], tmp_path)
@@ -534,8 +568,10 @@ def test_claude_cli_adds_dir_and_read_instruction(tmp_path, monkeypatch):
         return MagicMock(returncode=0, stdout=json.dumps(envelope), stderr="")
 
     monkeypatch.setattr(llm, "_response_is_hollow", lambda raw, parsed: False)
-    with patch("shutil.which", return_value="/fake/claude"), \
-         patch("subprocess.run", side_effect=fake_run):
+    with (
+        patch("shutil.which", return_value="/fake/claude"),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
         llm._call_claude_cli("CORPUS", images=refs)
 
     assert "--add-dir" in seen["args"]
@@ -545,6 +581,7 @@ def test_claude_cli_adds_dir_and_read_instruction(tmp_path, monkeypatch):
 
 
 # ── dispatch-level vision gating ──────────────────────────────────────────────
+
 
 def test_extract_files_direct_gates_pixels_by_capability(tmp_path, monkeypatch):
     img, _, doc = _make_corpus(tmp_path)
@@ -556,9 +593,10 @@ def test_extract_files_direct_gates_pixels_by_capability(tmp_path, monkeypatch):
     llm.extract_files_direct([doc, img], backend="openai", root=tmp_path)
     assert isinstance(captured["messages"][1]["content"], list)
 
-    # non-vision backend (deepseek) -> pixels stripped, content is a plain string
+    # A non-vision backend must fail before transport rather than silently
+    # replacing the admitted pixels with a text-only path reference.
     captured.clear()
     monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
-    llm.extract_files_direct([doc, img], backend="deepseek", root=tmp_path)
-    content = captured["messages"][1]["content"]
-    assert isinstance(content, str) and "sub/diagram.png" in content
+    with pytest.raises(raster.RasterPreflightError, match="does not support raster transport"):
+        llm.extract_files_direct([doc, img], backend="deepseek", root=tmp_path)
+    assert captured == {}
