@@ -84,9 +84,11 @@ def test_label_cli_passes_model_override(tmp_path, monkeypatch):
     captured = {}
 
     def fake_generate(G, communities, *, backend=None, model=None, gods=None,
-                      quiet=False, max_concurrency=4, batch_size=100, usage_out=None):
+                      quiet=False, max_concurrency=4, batch_size=100, usage_out=None,
+                      effort=None):
         captured["backend"] = backend
         captured["model"] = model
+        captured["effort"] = effort
         captured["max_concurrency"] = max_concurrency
         captured["batch_size"] = batch_size
         return {0: "Orders"}, "llm"
@@ -104,6 +106,8 @@ def test_label_cli_passes_model_override(tmp_path, monkeypatch):
             "gemini",
             "--model",
             "gemini-3.1-flash-lite",
+            "--effort",
+            "high",
             "--max-concurrency",
             "8",
             "--batch-size",
@@ -117,7 +121,7 @@ def test_label_cli_passes_model_override(tmp_path, monkeypatch):
     # Also verifies the space-separated forms parse (the value must not be mistaken
     # for the positional path) and reach generate_community_labels.
     assert captured == {
-        "backend": "gemini", "model": "gemini-3.1-flash-lite",
+        "backend": "gemini", "model": "gemini-3.1-flash-lite", "effort": "high",
         "max_concurrency": 8, "batch_size": 50,
     }
 
@@ -203,6 +207,9 @@ def test_generate_community_labels_degrades_on_error(monkeypatch):
 def test_generate_community_labels_no_backend(monkeypatch):
     G, communities = _graph()
     monkeypatch.setattr("graphify.llm.detect_backend", lambda: None)
+    # Keep hermetic: the claude-cli labelling fallback (#3475) probes PATH, so a
+    # machine with `claude` installed would otherwise take the CLI path here.
+    monkeypatch.setattr("graphify.llm._claude_cli_available", lambda: False)
     labels, source = generate_community_labels(G, communities, backend=None, quiet=True)
     assert source == "placeholder"
     assert labels == {0: "Community 0", 1: "Community 1"}
@@ -275,7 +282,11 @@ def test_label_communities_batches_when_over_batch_size(monkeypatch):
         return "{" + ", ".join(f'"{c}": "Cluster {c}"' for c in cids) + "}"
 
     monkeypatch.setattr("graphify.llm._call_llm", fake_call)
-    labels = label_communities(G, communities, backend="gemini", batch_size=100)
+    # max_concurrency=1 keeps the batches sequential so `calls` records them in a
+    # deterministic order; the default concurrent path can complete them out of
+    # order (the ordering is asserted separately in
+    # test_label_communities_parallel_matches_sequential).
+    labels = label_communities(G, communities, backend="gemini", batch_size=100, max_concurrency=1)
 
     # 250 communities / 100 per batch -> 3 batches (100, 100, 50)
     assert calls == [100, 100, 50]

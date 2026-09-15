@@ -160,8 +160,26 @@ def __getattr__(name: str) -> str:
 
 
 
-def _check_skill_version(skill_dst: Path) -> None:
-    """Warn if the installed skill is from an older graphify version."""
+def _check_skill_version(skill_dst: Path, platform_names: "list[str] | None" = None) -> None:
+    """Warn if the installed skill is from an older graphify version.
+
+    ``platform_names`` are the platforms installing into this destination
+    (resolved here when not given - the call site passes one positional
+    argument only, because tests stub this function with one-arg lambdas), so
+    the warning can name the exact command that refreshes THIS copy (#3144):
+    a plain `graphify install` only refreshes the detected platform, and a
+    stale marker at another platform's destination made the warning permanent
+    - the user followed the advice, the warning stayed, and only editing the
+    marker by hand cleared it.
+    """
+    if platform_names is None:
+        try:
+            platform_names = [
+                name for name in _PLATFORM_CONFIG
+                if _platform_skill_destination(name) == skill_dst
+            ]
+        except Exception:
+            platform_names = []
     version_file = skill_dst.parent / ".graphify_version"
     try:
         if not version_file.exists():
@@ -203,7 +221,16 @@ def _check_skill_version(skill_dst: Path) -> None:
                 file=sys.stderr,
             )
         else:
-            print(f"  warning: skill is from graphify {installed}, package is {__version__}. Run 'graphify install' to update.", file=sys.stderr)
+            _cmd = (
+                f"graphify install --platform {platform_names[0]}"
+                if platform_names else "graphify install"
+            )
+            print(
+                f"  warning: skill at {skill_dst.parent} is from graphify {installed}, "
+                f"package is {__version__}. Run '{_cmd}' to update it "
+                f"(a plain 'graphify install' refreshes only the detected platform).",
+                file=sys.stderr,
+            )
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
@@ -534,6 +561,9 @@ def _run_cli() -> None:
         print("    --contributor \"Name\"    tag who added it to the corpus")
         print("    --dir <path>            target directory (default: ./raw)")
         print("  watch <path>            watch a folder and rebuild the graph on code changes")
+        print("    --semantic              also run LLM extraction automatically on doc/image changes")
+        print("    --backend <name>        extraction backend for --semantic")
+        print("    --fallback-backend <name>  fallback backend for --semantic")
         print("  update <path>           re-extract code files and update the graph (no LLM needed)")
         print("    --force                 overwrite graph.json even if the rebuild has fewer nodes")
         print("                            (also: GRAPHIFY_FORCE=1 env var; use after refactors that delete code)")
@@ -544,13 +574,14 @@ def _run_cli() -> None:
         print("    --no-label              keep 'Community N' placeholders (skip LLM community naming)")
         print("    --backend=<name>        backend to use for community naming (default: auto-detect)")
         print("    --model=<name>          model to use for community naming")
-        print("    --max-concurrency=N     parallel community-labeling LLM calls (default 4; forced to 1 for ollama/claude-cli)")
+        # PATCHED FOR TELB-COCKPIT: openai-cli is also forced serial in llm.py.
+        print("    --max-concurrency=N     parallel community-labeling LLM calls (default 4; forced to 1 for ollama/claude-cli/openai-cli)")
         print("    --batch-size=N          communities per labeling LLM call (default 100)")
         print("  label <path>            (re)name communities with the configured LLM backend, regenerate report")
         print("    --missing-only         keep existing labels and only name missing/placeholder communities")
         print("    --backend=<name>        backend to use (default: auto-detect from API keys)")
         print("    --model=<name>          model to use for community naming")
-        print("    --max-concurrency=N     parallel labeling LLM calls (default 4; forced to 1 for ollama/claude-cli)")
+        print("    --max-concurrency=N     parallel labeling LLM calls (default 4; forced to 1 for ollama/claude-cli/openai-cli)")
         print("    --batch-size=N          communities per labeling LLM call (default 100)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
@@ -565,6 +596,7 @@ def _run_cli() -> None:
         print("    --top N                 how many to show (default 10)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("    --json                  emit JSON instead of text")
+        print("  prs                     PR dashboard: CI state, review status, worktree mapping")
         print("  save-result             save a Q&A result to graphify-out/memory/ for graph feedback loop")
         print("    --question Q            the question asked")
         print("    --answer A              the answer to save")
@@ -617,13 +649,25 @@ def _run_cli() -> None:
         print("    --cargo                 extract crate→crate deps from Cargo.toml")
         print("    --global                also merge the resulting graph into the global graph")
         print("    --as <tag>              repo tag for --global (default: target directory name)")
+        print("  provider [list|show|add|remove]  manage custom LLM providers")
         print("  global add <graph.json>  add/update a project graph in the global graph (~/.graphify/global-graph.json)")
         print("    --as <tag>               repo tag (default: parent directory name)")
         print("  global remove <tag>      remove a repo's nodes from the global graph")
         print("  global list              list repos in the global graph")
         print("  global path              print path to the global graph file")
         print("  benchmark [graph.json]  measure token reduction vs naive full-corpus approach")
+        print("  export html             emit interactive graph.html [--graph PATH] [--labels PATH] [--node-limit N] [--no-viz]")
         print("  export callflow-html    emit Mermaid-based architecture/call-flow HTML")
+        print("                          [GRAPH|DIR] [--graph PATH] [--labels PATH] [--report PATH] [--sections PATH] [--output HTML]")
+        print("                          [--lang auto|zh-CN|en] [--max-sections N] [--diagram-scale N]")
+        print("  export obsidian         emit Obsidian vault notes + canvas [--graph PATH] [--labels PATH] [--dir PATH]")
+        print("  export wiki             emit wiki markdown articles [--graph PATH] [--labels PATH]")
+        print("  export svg              emit graph.svg [--graph PATH] [--labels PATH]")
+        print("  export graphml          emit GraphML [--graph PATH]")
+        print("  export neo4j            emit Cypher or push to Neo4j [--graph PATH] [--push URI] [--user U] [--password P]")
+        print("                          (or set NEO4J_PASSWORD instead of --password to keep it off argv)")
+        print("  export falkordb         emit Cypher or push to FalkorDB [--graph PATH] [--push URI] [--user U] [--password P]")
+        print("                          (or set FALKORDB_PASSWORD instead of --password to keep it off argv)")
         print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
         print("  hook uninstall          remove git hooks")
         print("  hook status             check if git hooks are installed")

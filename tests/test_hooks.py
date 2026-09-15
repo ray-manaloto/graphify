@@ -2,6 +2,8 @@
 import os
 import shutil
 import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 from pathlib import Path
 import pytest
@@ -320,7 +322,9 @@ def test_rebuild_bodies_read_graphify_root(name, body):
     # The recovered root is what gets rebuilt, not a hardcoded cwd.
     assert "_rebuild_code(_root" in body, f"{name} does not pass the recovered root"
     # Quote-safe inside the shell-double-quoted launcher: single quotes only.
-    assert "read_text(encoding='utf-8')" in body, f"{name} root read is not single-quoted"
+    # `utf-8-sig` rather than `utf-8` so a Windows PowerShell 5.1 BOM cannot ride
+    # into the path (#3028); the codec is a no-op on a BOM-less marker.
+    assert "read_text(encoding='utf-8-sig')" in body, f"{name} root read is not single-quoted"
 
 
 def test_rebuild_bodies_with_graphify_root_are_valid_python():
@@ -328,6 +332,78 @@ def test_rebuild_bodies_with_graphify_root_are_valid_python():
     that crashes the moment git fires it (#1173)."""
     for body in (_REBUILD_BODY_COMMIT, _REBUILD_BODY_CHECKOUT):
         ast.parse(body)
+
+
+def _extract_root_resolution(body: str) -> str:
+    """Pull the `.graphify_root` -> `_root` snippet out of a rebuild body, so a
+    test can execute the shipped logic itself rather than a hand copy that could
+    quietly drift from it."""
+    match = re.search(r"(    _root = Path\('\.'\).*?)\n    _rebuild_code\(", body, re.DOTALL)
+    assert match, "root resolution snippet not found"
+    return textwrap.dedent(match.group(1))
+
+
+@pytest.mark.parametrize(
+    "name,body",
+    [("post-commit", _REBUILD_BODY_COMMIT), ("post-checkout", _REBUILD_BODY_CHECKOUT)],
+)
+def test_rebuild_bodies_reject_an_out_of_repo_graphify_root(name, body, tmp_path, monkeypatch):
+    """#3265: `.graphify_root` sits inside graphify-out/, a directory the
+    documented team workflow says to commit, so its contents are checkout
+    controlled. Without a bound, a value planted there by a malicious fork or PR
+    (an absolute path outside the repository) would steer the rebuild -- and so
+    what gets read, and what gets written into the same committed graphify-out/
+    -- to wherever the checkout names, not the repository the hook was installed
+    into. The recovered root must stay inside the working tree the hook actually
+    runs from."""
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    (repo / "graphify-out").mkdir(parents=True)
+    outside.mkdir()
+    (repo / "graphify-out" / ".graphify_root").write_text(str(outside), encoding="utf-8")
+    monkeypatch.chdir(repo)
+    ns = {"Path": Path, "os": os}
+    exec(compile(_extract_root_resolution(body), "<rebuild_body>", "exec"), ns)
+    assert ns["_root"].resolve() == repo.resolve(), f"{name} honoured an out-of-repo root"
+
+
+@pytest.mark.parametrize(
+    "name,body",
+    [("post-commit", _REBUILD_BODY_COMMIT), ("post-checkout", _REBUILD_BODY_CHECKOUT)],
+)
+def test_rebuild_bodies_honour_an_in_repo_graphify_root(name, body, tmp_path, monkeypatch):
+    """The legitimate case the #3265 guard must not break: a subdirectory-scoped
+    root (#1173) is still recovered."""
+    repo = tmp_path / "repo"
+    (repo / "graphify-out").mkdir(parents=True)
+    (repo / "backend").mkdir()
+    (repo / "graphify-out" / ".graphify_root").write_text("backend", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    ns = {"Path": Path, "os": os}
+    exec(compile(_extract_root_resolution(body), "<rebuild_body>", "exec"), ns)
+    assert ns["_root"].resolve() == (repo / "backend").resolve(), f"{name} lost the scoped root"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink setup differs on Windows")
+@pytest.mark.parametrize(
+    "name,body",
+    [("post-commit", _REBUILD_BODY_COMMIT), ("post-checkout", _REBUILD_BODY_CHECKOUT)],
+)
+def test_rebuild_bodies_survive_a_graphify_root_symlink_loop(name, body, tmp_path, monkeypatch):
+    """A committed `.graphify_root` naming a path that resolves through a
+    symlink loop (two symlinks pointing at each other) must fall back to the
+    repo top rather than let `Path.resolve()`'s RuntimeError escape the #3265
+    guard uncaught -- the guard's own `except OSError` doesn't catch it, since
+    a symlink loop is a RuntimeError on this platform, not an OSError."""
+    repo = tmp_path / "repo"
+    (repo / "graphify-out").mkdir(parents=True)
+    (repo / "loop_a").symlink_to(repo / "loop_b")
+    (repo / "loop_b").symlink_to(repo / "loop_a")
+    (repo / "graphify-out" / ".graphify_root").write_text("loop_a", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    ns = {"Path": Path, "os": os}
+    exec(compile(_extract_root_resolution(body), "<rebuild_body>", "exec"), ns)
+    assert ns["_root"].resolve() == repo.resolve(), f"{name} did not fall back on a symlink loop"
 
 
 @pytest.mark.parametrize(
@@ -353,6 +429,111 @@ def test_rebuild_bodies_arm_a_timeout_without_sigalrm(name, body):
     # rest of the body, or the same event reads differently per platform.
     prefixes = set(re.findall(r"print\(f'\[([a-z ]+)\]", body))
     assert len(prefixes) == 1, f"{name} mixes log prefixes {sorted(prefixes)} (#2148)"
+
+
+@pytest.mark.parametrize(
+    "name,body",
+    [("post-commit", _REBUILD_BODY_COMMIT), ("post-checkout", _REBUILD_BODY_CHECKOUT)],
+)
+def test_rebuild_bodies_kill_children_before_os_exit(name, body):
+    """os._exit() terminates only the rebuild process itself, not any
+    ProcessPoolExecutor worker it spawned for a large corpus -- os._exit skips
+    every cleanup path, including the pool's own context-manager shutdown, so a
+    worker mid-task at the moment the watchdog fires is orphaned (reparented to
+    PID 1 on POSIX) and keeps running, unsupervised, for as long as whatever it
+    was doing takes. A worker stuck in catastrophic regex backtracking (the
+    exact shape #3341 fixed) has been observed surviving 2.5 days that way. The
+    watchdog owns no reference to the pool object (it fires on a separate timer
+    thread, unrelated to whichever stack frame currently holds the pool), but
+    multiprocessing.active_children() enumerates every live worker process
+    regardless of which thread asks, so the fallback kills them by SIGKILL
+    (not terminate/SIGTERM, which a process stuck in a C-level call like
+    regex backtracking never gets a chance to act on) before exiting itself."""
+    fallbacks = [
+        node.orelse
+        for node in ast.walk(ast.parse(body))
+        if isinstance(node, ast.If) and "'SIGALRM'" in ast.dump(node.test) and node.orelse
+    ]
+    assert fallbacks, f"{name} has no else-branch for the missing-SIGALRM case"
+    dumped = "".join(ast.dump(stmt) for stmt in fallbacks[0])
+    assert "attr='active_children'" in dumped, (
+        f"{name} fallback does not enumerate live workers before exiting (#3341 follow-up)"
+    )
+    assert "attr='kill'" in dumped, (
+        f"{name} fallback does not SIGKILL orphaned workers before exiting (#3341 follow-up)"
+    )
+    # The kill loop must run BEFORE os._exit, not after (dead code) or replacing
+    # it (the rebuild process itself still has to exit on timeout). _bail's body
+    # is a straight-line statement list (no branching), so statement POSITION is
+    # execution order -- unlike ast.walk's traversal, which is breadth-first and
+    # would visit os._exit's Call node (a direct child of a top-level Expr)
+    # before a Call nested one level deeper inside the for loop's body, even
+    # though the for loop is written, and runs, first.
+    bail_def = next(
+        n for n in ast.walk(ast.parse(body))
+        if isinstance(n, ast.FunctionDef) and n.name == "_bail"
+    )
+    def _stmt_index_calling(attr: str) -> int:
+        for i, stmt in enumerate(bail_def.body):
+            if any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == attr
+                for n in ast.walk(stmt)
+            ):
+                return i
+        raise AssertionError(f"{name}: no statement in _bail calls .{attr}(...)")
+    assert _stmt_index_calling("active_children") < _stmt_index_calling("_exit"), (
+        f"{name} kills workers after os._exit instead of before"
+    )
+
+
+@pytest.mark.parametrize(
+    "name,body",
+    [("post-commit", _REBUILD_BODY_COMMIT), ("post-checkout", _REBUILD_BODY_CHECKOUT)],
+)
+def test_sigalrm_handler_kills_children_before_raising(name, body):
+    """The no-SIGALRM fallback killing children before os._exit is not enough:
+    on POSIX, where SIGALRM IS available, a TimeoutError raised while the main
+    thread is waiting inside the ProcessPoolExecutor with-block propagates
+    straight through that block's own __exit__, which calls
+    shutdown(wait=True) and blocks until every worker exits -- forever, for a
+    worker stuck in a C-level call the alarm firing does nothing to stop
+    (reproduced: a worker in an unconditional loop left the process still
+    running 15s after a 2s alarm). The except TimeoutError handler is never
+    reached, so the timeout provides no bound at all in that case. Killing
+    workers INSIDE the signal handler, before it raises, means shutdown has
+    nothing left to wait for by the time the exception reaches it."""
+    handler_def = next(
+        n for n in ast.walk(ast.parse(body))
+        if isinstance(n, ast.FunctionDef) and n.name == "_sigalrm_bail"
+    )
+    dumped = "".join(ast.dump(stmt) for stmt in handler_def.body)
+    assert "attr='active_children'" in dumped, (
+        f"{name} SIGALRM handler does not enumerate live workers (#3397 follow-up)"
+    )
+    assert "attr='kill'" in dumped, (
+        f"{name} SIGALRM handler does not SIGKILL workers (#3397 follow-up)"
+    )
+
+    def _stmt_index_calling(attr: str) -> int:
+        for i, stmt in enumerate(handler_def.body):
+            if any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == attr
+                for n in ast.walk(stmt)
+            ):
+                return i
+        raise AssertionError(f"{name}: no statement in _sigalrm_bail calls .{attr}(...)")
+    kill_idx = _stmt_index_calling("kill")
+    raise_idx = next(
+        i for i, stmt in enumerate(handler_def.body) if isinstance(stmt, ast.Raise)
+    )
+    assert kill_idx < raise_idx, (
+        f"{name} raises TimeoutError before killing workers, defeating the fix"
+    )
+    # signal.signal must be wired to this handler, not still the old inline
+    # lambda that only threw the exception.
+    assert re.search(r"signal\.signal\(signal\.SIGALRM,\s*_sigalrm_bail\)", body), (
+        f"{name} does not register _sigalrm_bail as the SIGALRM handler"
+    )
 
 
 def test_detached_launch_targets_graphify_python():
@@ -767,7 +948,8 @@ def test_checkout_hook_skips_same_head_noop_at_runtime():
     assert guard in _CHECKOUT_SCRIPT, "guard missing from the checkout script"
     # Real script through the same-head guard, then a sentinel — stops before the
     # graphify-out check / detached launch so nothing is actually rebuilt.
-    prefix = _CHECKOUT_SCRIPT.split(guard)[0] + guard + "\necho RAN\n"
+    # The block runs inside a subshell (#2986); close it after the sentinel.
+    prefix = _CHECKOUT_SCRIPT.split(guard)[0] + guard + "\necho RAN\n)\n"
 
     def run(prev, new, flag):
         # sh -c CMD name arg1 arg2 arg3  ->  $0=name $1=prev $2=new $3=flag
@@ -1144,3 +1326,83 @@ def test_both_hooks_configured(tmp_path):
     for name in ("post-commit", "post-checkout"):
         hook_text = (repo / ".git" / "hooks" / name).read_text()
         assert 'export GRAPHIFY_VIZ_NODE_LIMIT="${GRAPHIFY_VIZ_NODE_LIMIT:-42}"' in hook_text
+
+
+@pytest.mark.parametrize(
+    "name,body",
+    [("post-commit", _REBUILD_BODY_COMMIT), ("post-checkout", _REBUILD_BODY_CHECKOUT)],
+)
+def test_rebuild_bodies_tolerate_a_bom_in_graphify_root(name, body):
+    """The rebuild must survive a marker written by Windows PowerShell 5.1 (#3028).
+
+    `Out-File -Encoding utf8` on 5.1 always writes a UTF-8 BOM, so the path the
+    hook reads back begins with U+FEFF. `strip()` does not remove it, and it rode
+    straight into a Windows path API: every post-commit rebuild died with
+    `WinError 123` while `hook install` / `hook status` still reported success.
+    `utf-8-sig` drops an optional BOM and is a no-op on a clean file.
+    """
+    assert "encoding='utf-8-sig'" in body, (
+        f"{name} rebuild body must read .graphify_root BOM-tolerantly"
+    )
+    assert "encoding='utf-8')" not in body, (
+        f"{name} rebuild body still has a BOM-intolerant read"
+    )
+
+
+@pytest.mark.parametrize("exe", [
+    "/home/dev/snap/code/259/.local/share/uv/tools/graphifyy/bin/python",
+    "/home/dev/snap/code/current/.local/share/uv/tools/graphifyy/bin/python",
+    "/root/snap/pycharm-community/42/.local/share/uv/tools/graphifyy/bin/python",
+])
+def test_pinned_python_refuses_a_rotating_snap_revision(exe, monkeypatch):
+    """A pin is only worth writing if it still resolves tomorrow.
+
+    graphify installed from inside a snap-confined editor lives under
+    ``~/snap/<app>/<revision>/``. Snap swaps that revision on update and prunes the
+    old tree, so the pin dies silently — observed across 15 repositories at once
+    when an editor snap moved past revision 259. Every commit then printed "could
+    not locate a Python with graphify installed" and the graphs quietly stopped
+    tracking the code.
+
+    Empty is the documented safe degradation: the hook falls through to its other
+    probes, and the uv-tools probe searches snap homes by glob.
+    """
+    import sys as _sys
+
+    from graphify.hooks import _pinned_python
+
+    monkeypatch.setattr(_sys, "executable", exe)
+    assert _pinned_python() == "", "a path under a rotating snap revision must not be pinned"
+
+
+def test_pinned_python_still_pins_a_stable_path(monkeypatch):
+    """The rotating-prefix rule must not swallow ordinary installs.
+
+    Control for the test above: 'snap' appearing anywhere else in a path — a user
+    named snap, a project directory called snap — is not a snap revision tree.
+    """
+    import sys as _sys
+
+    from graphify.hooks import _pinned_python
+
+    for exe in (
+        "/home/dev/.local/share/uv/tools/graphifyy/bin/python",
+        "/usr/bin/python3",
+        "/home/snap/projects/venv/bin/python",
+    ):
+        monkeypatch.setattr(_sys, "executable", exe)
+        assert _pinned_python() == exe, f"{exe} is stable and must still be pinned"
+
+
+def test_hook_probes_snap_confined_uv_tool_dirs():
+    """The uv-tools probe must look inside snap-confined HOMEs.
+
+    An install made from a snap-confined editor lands in that snap's private HOME.
+    Once the hook runs from an ordinary shell, $HOME is the real one, so the plain
+    roots never see it — which is what left the pin as the only thing that could
+    ever find such an install.
+    """
+    from graphify.hooks import _HOOK_SCRIPT
+
+    assert '"$HOME"/snap/*/[0-9]*/.local/share/uv/tools' in _HOOK_SCRIPT
+    assert '"$HOME"/snap/*/current/.local/share/uv/tools' in _HOOK_SCRIPT

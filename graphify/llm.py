@@ -12,7 +12,8 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -23,6 +24,13 @@ from graphify.file_slice import (
     expand_oversized_files,
     read_slice_text,
     unit_path,
+)
+from graphify.execution import (
+    build_cli_invocation,
+    resolve_execution_profile,
+    run_cli_invocation,
+    validate_effective_managed_mode,
+    validate_run_context,
 )
 
 # `_read_files` truncates each file at this many characters before joining into
@@ -172,7 +180,10 @@ BACKENDS: dict[str, dict] = {
         "default_model": "deepseek-v4-flash",
         "env_key": "DEEPSEEK_API_KEY",
         "model_env_key": "GRAPHIFY_DEEPSEEK_MODEL",
-        "pricing": {"input": 0.14, "output": 0.28},  # USD per 1M tokens (v4-flash)
+        "pricing": {"input": 0.44, "output": 1.32},  # USD per 1M tokens (v4-flash,
+        # peak, cache miss). Peak is 01:00-04:00 and 06:00-10:00 UTC Mon-Fri;
+        # all other hours are off-peak at half these rates. A cache hit is
+        # $0.014/1M in. Source: api-docs.deepseek.com/quick_start/pricing
         # deepseek-reasoner silently ignores temperature; deepseek-chat / v4-flash
         # accept 0-2, so sending 0 is safe. Note: deepseek-v4-flash (and v4-pro) have
         # thinking ENABLED by default (verified against the live API, #1621) — set
@@ -215,6 +226,19 @@ BACKENDS: dict[str, dict] = {
         # Claude Code is multimodal; images are passed by path and read with the
         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
         "vision": True,
+    },
+    # PATCHED FOR TELB-COCKPIT (2026-08-19). This explicit backend routes graph
+    # extraction through the owner's authenticated Codex CLI/ChatGPT subscription.
+    # If an upgrade removes it, the backend silently disappears and extraction can
+    # fall back to the metered OpenAI API — a spending regression.
+    "openai-cli": {
+        "default_model": "gpt-5.6-sol",
+        "model_env_key": "GRAPHIFY_OPENAI_CLI_MODEL",
+        # Subscription usage is not metered API spend; zero pricing is intentional.
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": None,
+        "max_tokens": 16384,
+        "vision": False,
     },
 }
 
@@ -538,7 +562,8 @@ def _resolve_under_root(path: Path, root: Path) -> Path | None:
     """Return the resolved path only when it stays inside ``root``."""
     try:
         resolved_root = root.resolve()
-        resolved_path = path.resolve()
+        candidate = path if path.is_absolute() else root / path
+        resolved_path = candidate.resolve()
         resolved_path.relative_to(resolved_root)
     except (OSError, RuntimeError, ValueError):
         return None
@@ -553,9 +578,14 @@ def _resolve_under_root(path: Path, root: Path) -> Path | None:
 # a file cannot forge an early `</untrusted_source>` and smuggle instructions out.
 _INJECTION_SENTINELS = re.compile(
     r"</?untrusted_source\b[^>]*>"
-    r"|<\|(?:im_start|im_end|system|user|assistant|endoftext)\|>"
+    # ANY <|token|> chat-template marker, not an enumerated few (#3183): the
+    # old list named six and missed <|start_header_id|>/<|eot_id|> (Llama 3),
+    # <|endofprompt|>, and whatever the next template calls its turns. The
+    # form itself is the hazard - no legitimate source construct needs an
+    # intact one, and defanging only inserts a zero-width space.
+    r"|<\|[A-Za-z0-9_.\-]{1,64}\|>"
     r"|<<SYS>>|<</SYS>>"
-    r"|\[/?INST\]"
+    r"|\[/?(?:INST|SYSTEM)\]"
     r"|^\s*###?\s*(?:system|instruction)s?\s*:?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -780,7 +810,7 @@ _MAX_IMAGES_PER_CHUNK = 20
 # Backends that read an image by file path (claude-cli's Read tool)
 # instead of inlining base64. They open the file themselves and downsample as
 # needed, so `_MAX_IMAGE_BYTES` does not apply and the bytes never need loading.
-_PATH_IMAGE_BACKENDS = {"claude-cli"}
+_PATH_IMAGE_BACKENDS = {"claude-cli", "openai-cli"}
 
 
 @dataclass
@@ -825,7 +855,13 @@ def _partition_semantic_files(
     return text_units, image_files
 
 
-def _build_image_refs(image_files: list[Path], root: Path, *, read_bytes: bool = True) -> list[_ImageRef]:
+def _build_image_refs(
+    image_files: list[Path],
+    root: Path,
+    *,
+    read_bytes: bool = True,
+    strict: bool = False,
+) -> list[_ImageRef]:
     """Build `_ImageRef`s for raster images.
 
     `read_bytes=True` (base64 backends) loads the pixels and drops any image over
@@ -839,7 +875,18 @@ def _build_image_refs(image_files: list[Path], root: Path, *, read_bytes: bool =
     for p in image_files:
         abs_path = _resolve_under_root(p, root)
         if abs_path is None:
-            print(f"[graphify] skipping image {p}: symlink target outside corpus root", file=sys.stderr)
+            if strict:
+                from graphify.raster import RasterPreflightError
+
+                raise RasterPreflightError(
+                    "source_changed",
+                    "raster source changed or resolved outside corpus root after preflight",
+                    source_path=str(p),
+                )
+            print(
+                f"[graphify] skipping image {p}: symlink target outside corpus root",
+                file=sys.stderr,
+            )
             continue
         try:
             # as_posix, not str: `rel` is handed to the model as the literal
@@ -855,9 +902,28 @@ def _build_image_refs(image_files: list[Path], root: Path, *, read_bytes: bool =
             try:
                 raw = abs_path.read_bytes()
             except OSError as exc:
+                if strict:
+                    from graphify.raster import RasterPreflightError
+
+                    raise RasterPreflightError(
+                        "source_changed",
+                        "raster source could not be reread after preflight",
+                        source_path=rel,
+                        error_type=type(exc).__name__,
+                    ) from exc
                 print(f"[graphify] could not read image {rel}: {exc}", file=sys.stderr)
                 raw = None
             if raw is not None and len(raw) > _MAX_IMAGE_BYTES:
+                if strict:
+                    from graphify.raster import RasterPreflightError
+
+                    raise RasterPreflightError(
+                        "source_changed",
+                        "raster source exceeded the byte limit after preflight",
+                        source_path=rel,
+                        size_bytes=len(raw),
+                        max_bytes=_MAX_IMAGE_BYTES,
+                    )
                 print(
                     f"[graphify] image {rel} is {len(raw) // 1024} KB, over the "
                     f"{_MAX_IMAGE_BYTES // (1024 * 1024)} MB inline-image limit for this "
@@ -884,6 +950,208 @@ def _backend_supports_vision(backend: str) -> bool:
     if backend == "ollama":
         return os.environ.get("GRAPHIFY_OLLAMA_VISION", "").strip() == "1"
     return bool(BACKENDS.get(backend, {}).get("vision", False))
+
+
+def _image_source_label(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+def _raster_evidence(prepared: Mapping | None) -> dict:
+    if not prepared:
+        return {"preflight_batches": [], "attachments": []}
+    return {
+        "preflight_batches": prepared["preflight_batches"],
+        "attachments": prepared["attachments"],
+    }
+
+def _attach_raster_evidence(result: dict, prepared: Mapping | None) -> dict:
+    evidence = _raster_evidence(prepared)
+    if evidence["preflight_batches"]:
+        result["_raster_evidence"] = evidence
+    return result
+
+
+def _preflight_raster_cache_admission(files: Sequence[Path | FileSlice], *, root: Path) -> dict:
+    """Admit every raster before cache lookup and derive stable source keys."""
+    from graphify.raster import (
+        MAX_DIRECT_RASTERS,
+        preflight_raster_batch,
+        raster_attachment_compatibility,
+    )
+
+    images = [item for item in files if isinstance(item, Path) and _is_vision_image(item)]
+    batches: list[dict] = []
+    compatibility: dict[str, str] = {}
+    for offset in range(0, len(images), MAX_DIRECT_RASTERS):
+        group = images[offset : offset + MAX_DIRECT_RASTERS]
+        requests = [{"path": str(path), "label": _image_source_label(path, root)} for path in group]
+        preflight = preflight_raster_batch(requests, root=root)
+        current = raster_attachment_compatibility(preflight)
+        overlap = compatibility.keys() & current.keys()
+        conflicts = sorted(key for key in overlap if compatibility[key] != current[key])
+        if conflicts:
+            raise ValueError(f"conflicting raster attachment compatibility for {conflicts[0]}")
+        compatibility.update(current)
+        batches.append(preflight)
+    return {"preflight_batches": batches, "attachment_compatibility": compatibility}
+
+
+def _split_chunks_by_raster_limit(
+    chunks: Sequence[Sequence[Path | FileSlice]],
+) -> list[list[Path | FileSlice]]:
+    """Keep every actual model call within the direct raster limit."""
+    from graphify.raster import MAX_DIRECT_RASTERS
+
+    bounded: list[list[Path | FileSlice]] = []
+    for chunk in chunks:
+        current: list[Path | FileSlice] = []
+        raster_count = 0
+        for unit in chunk:
+            is_raster = isinstance(unit, Path) and _is_vision_image(unit)
+            if is_raster and raster_count == MAX_DIRECT_RASTERS:
+                bounded.append(current)
+                current = []
+                raster_count = 0
+            current.append(unit)
+            raster_count += int(is_raster)
+        if current:
+            bounded.append(current)
+    return bounded
+
+
+@contextmanager
+def _prepare_cli_raster_attachments(
+    chunks: Sequence[Sequence[Path | FileSlice]],
+    *,
+    backend: str,
+    root: Path,
+    execution_profile: dict | None,
+    run_context: dict | None,
+    attachment_stager: Callable[[dict], Mapping] | None,
+    attachment_snapshot_root: Path | None,
+) -> Iterator[dict]:
+    """Admit every raster before work, then hold any local stage for the request."""
+    from graphify.raster import (
+        MAX_DIRECT_RASTERS,
+        preflight_raster_batch,
+        raster_attachment_compatibility,
+        raster_attachment_source_records,
+        stage_ephemeral_raster_attachments,
+        verify_raster_snapshot_ack,
+    )
+
+    root = Path(root)
+    if attachment_snapshot_root is not None:
+        attachment_snapshot_root = Path(attachment_snapshot_root)
+    pair = (attachment_stager is not None, attachment_snapshot_root is not None)
+    if pair[0] != pair[1]:
+        raise ValueError("attachment_stager and attachment_snapshot_root must be supplied together")
+    _validated_context, durable_required = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+
+    preflight_batches: list[dict] = []
+    source_records: list[dict] = []
+    attachment_compatibility: dict[str, str] = {}
+    try:
+        for chunk in chunks:
+            images = [unit for unit in chunk if isinstance(unit, Path) and _is_vision_image(unit)]
+            if not images:
+                continue
+            for offset in range(0, len(images), MAX_DIRECT_RASTERS):
+                group = images[offset : offset + MAX_DIRECT_RASTERS]
+                requests = [
+                    {"path": str(path), "label": _image_source_label(path, root)} for path in group
+                ]
+                preflight = preflight_raster_batch(requests, root=root)
+                preflight_batches.append(preflight)
+                current_compatibility = raster_attachment_compatibility(preflight)
+                overlap = attachment_compatibility.keys() & current_compatibility.keys()
+                if any(
+                    attachment_compatibility[key] != current_compatibility[key] for key in overlap
+                ):
+                    raise ValueError("conflicting raster attachment compatibility")
+                attachment_compatibility.update(current_compatibility)
+                source_records.extend(raster_attachment_source_records(preflight))
+    except BaseException as exc:
+        exc.__dict__["graphify_raster_evidence"] = {
+            "preflight_batches": preflight_batches,
+            "attachments": [],
+        }
+        raise
+
+    prepared = {
+        "preflight_batches": preflight_batches,
+        "attachment_compatibility": attachment_compatibility,
+        "source_records": source_records,
+        "source_records_by_path": {
+            item["original_source"]["canonical_path"]: item for item in source_records
+        },
+        "attachments": [],
+        "attachments_by_path": {},
+    }
+    try:
+        if not source_records or backend not in {"claude-cli", "openai-cli"}:
+            yield prepared
+            return
+
+        if durable_required and not all(pair):
+            raise ValueError(
+                "capture-required raster execution requires attachment_stager and "
+                "attachment_snapshot_root"
+            )
+
+        if all(pair):
+            assert attachment_stager is not None
+            assert attachment_snapshot_root is not None
+            for source_record in source_records:
+                preflight = source_record["preflight"]
+                request = {
+                    "schema_version": 1,
+                    "operation": "stage_raster_attachment",
+                    "snapshot_root": str(attachment_snapshot_root),
+                    "source_record": source_record,
+                    "preflight_identity": preflight["identity"],
+                    "decoder": preflight["decoder"],
+                    "batch_sha256": preflight["batch_sha256"],
+                    "limits": preflight["limits"],
+                }
+                acknowledgment = attachment_stager(request)
+                completed = verify_raster_snapshot_ack(
+                    acknowledgment,
+                    source_record=source_record,
+                    snapshot_root=attachment_snapshot_root,
+                )
+                prepared["attachments"].append(completed)
+                prepared["attachments_by_path"][
+                    completed["original_source"]["canonical_path"]
+                ] = completed
+            yield prepared
+            return
+
+        if backend == "claude-cli":
+            # Ordinary Claude keeps its source-path transport after strict admission.
+            # This is compatible behavior, not durable snapshot evidence.
+            yield prepared
+            return
+
+        with stage_ephemeral_raster_attachments(source_records, root=root) as attachments:
+            prepared["attachments"] = attachments
+            prepared["attachments_by_path"] = {
+                item["original_source"]["canonical_path"]: item for item in attachments
+            }
+            yield prepared
+    except BaseException as exc:
+        exc.__dict__.setdefault(
+            "graphify_raster_evidence",
+            {
+                "preflight_batches": preflight_batches,
+                "attachments": prepared["attachments"],
+            },
+        )
+        raise
 
 
 def _image_notes(refs: list[_ImageRef], *, with_paths: bool = False) -> str:
@@ -1247,6 +1515,20 @@ def _response_is_hollow(raw_content: str | None, parsed: dict) -> bool:
     """
     if raw_content is None or not raw_content.strip():
         return True
+    try:
+        raw_value = json.loads(_THINK_BLOCK_RE.sub(" ", raw_content).strip())
+    except (json.JSONDecodeError, TypeError):
+        raw_value = None
+    if (
+        isinstance(raw_value, dict)
+        and isinstance(raw_value.get("nodes"), list)
+        and isinstance(raw_value.get("edges"), list)
+        and isinstance(raw_value.get("hyperedges", []), list)
+        and not raw_value["nodes"]
+        and not raw_value["edges"]
+        and not raw_value.get("hyperedges")
+    ):
+        return False
     nodes = parsed.get("nodes")
     edges = parsed.get("edges")
     hyperedges = parsed.get("hyperedges")
@@ -1516,6 +1798,40 @@ def _call_claude(api_key: str, model: str, user_message: str, max_tokens: int = 
     return result
 
 
+def _envelope_after_preamble(stdout: str):
+    """Recover the envelope when `claude -p` prefixes it with a diagnostic line.
+
+    The CLI shares stdout with its own subsystems, so the JSON is not always the
+    first thing on it. An attached MCP server that advertises no tools makes
+    every invocation emit
+
+        Client.listTools() called but server does not advertise tools capability
+        - returning empty list
+
+    ahead of the envelope, and `json.loads` then fails on the whole buffer.
+    Because that failure is raised after the model has already answered, the
+    chunk is discarded with its tokens spent -- on a mid-size corpus a run could
+    burn the whole budget and return nothing, and the error names the JSON
+    rather than the preamble that caused it, so the log points at the wrong
+    thing. Any user with an MCP server configured hits this on every chunk.
+
+    Scans for the first `[`/`{` that begins a valid JSON document. `raw_decode`
+    ignores trailing bytes, so a diagnostic on either side is tolerated, and
+    stdout carrying no JSON at all still returns None for the caller to raise on.
+    """
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(stdout):
+        if ch not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(stdout, idx)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+    return None
+
+
 def _claude_cli_envelope(stdout: str) -> dict:
     """Parse the JSON returned by `claude -p --output-format json`.
 
@@ -1528,10 +1844,12 @@ def _claude_cli_envelope(stdout: str) -> dict:
     try:
         envelope = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"claude -p produced unparseable JSON envelope: {exc}; "
-            f"first 500 chars of stdout: {stdout[:500]!r}"
-        ) from exc
+        envelope = _envelope_after_preamble(stdout)
+        if envelope is None:
+            raise RuntimeError(
+                f"claude -p produced unparseable JSON envelope: {exc}; "
+                f"first 500 chars of stdout: {stdout[:500]!r}"
+            ) from exc
     if isinstance(envelope, list):
         result_events = [
             e for e in envelope
@@ -1628,149 +1946,519 @@ def _claude_cli_supports_json_schema(claude_cmd: str) -> bool:
     return supported
 
 
-def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bool = False, images: list[_ImageRef] | None = None) -> dict:
-    """Call Claude via the locally-installed Claude Code CLI (`claude -p`).
+def _openai_cli_turn_usage(stdout: str) -> tuple[int, int]:
+    """Return token counts from the last Codex ``turn.completed`` JSONL event."""
+    completed_usage: dict | None = None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            # Codex stdout is JSONL, but tolerate diagnostics or malformed lines;
+            # losing accounting must never discard an otherwise valid extraction.
+            continue
+        if isinstance(event, dict) and event.get("type") == "turn.completed":
+            usage = event.get("usage")
+            completed_usage = usage if isinstance(usage, dict) else {}
 
-    Routes through the user's Claude Code subscription auth instead of a separate
-    ANTHROPIC_API_KEY. Useful for Pro/Max subscribers who don't want to provision
-    a pay-as-you-go API key just to run graphify's semantic pass.
+    if completed_usage is None:
+        # Without a completion event the exact counts are unknown; report zero
+        # rather than estimating or inventing usage.
+        return 0, 0
 
-    Images are passed by absolute path rather than inline base64: the prompt asks
-    the model to open each one with its Read tool, and each containing directory
-    is allowlisted with `--add-dir` so the read is permitted.
-    """
-    import platform
-    import shutil
-    import subprocess
+    def _count(name: str) -> int:
+        try:
+            return int(completed_usage.get(name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
-    # On Windows, npm installs `claude` as both `claude.ps1` and `claude.cmd`
-    # alongside each other. When PATHEXT lists `.PS1` before `.CMD`,
-    # `shutil.which("claude")` returns `claude.ps1`, which `CreateProcess`
-    # cannot execute directly — it raises `[WinError 2] The system cannot
-    # find the file specified`. `claude.cmd` IS executable by CreateProcess,
-    # so prefer it explicitly on Windows. See issue #1072.
-    claude_cmd = "claude"
-    if platform.system() == "Windows":
-        cmd_path = shutil.which("claude.cmd")
-        if cmd_path:
-            claude_cmd = cmd_path
-        elif shutil.which("claude") is None:
-            raise RuntimeError(
-                "Claude Code CLI not found on $PATH. Install from "
-                "https://claude.ai/code and run `claude` once to authenticate."
+    # Codex input_tokens already appears to include cached_input_tokens, so do
+    # not add the cached count again or usage will be double-counted.
+    return _count("input_tokens"), _count("output_tokens")
+
+
+def _openai_cli_vendor_detail(stderr: str, stdout: str) -> str:
+    """Return bounded Codex diagnostics, preserving stderr and stdout's tail."""
+    parts: list[str] = []
+    stderr_text = (stderr or "").strip()
+    stdout_text = (stdout or "").strip()
+    if stderr_text:
+        parts.append(f"stderr: {stderr_text[-400:]}")
+    if stdout_text:
+        # API errors, including HTTP 400 responses, can appear only in JSONL stdout.
+        parts.append(f"stdout tail: {stdout_text[-400:]}")
+    return " | ".join(parts) or "(no stderr or stdout)"
+
+
+def _managed_cli_call(
+    prompt: str,
+    *,
+    backend: str,
+    purpose: str,
+    max_tokens: int,
+    deep_mode: bool,
+    images: list[_ImageRef] | None,
+    prepared_attachments: list[dict] | None = None,
+    model: str | None,
+    effort: str | None,
+    execution_profile: dict | None,
+    run_context: dict | None,
+    process_runner: Callable | None,
+    receipt_sink: Callable | None,
+) -> dict:
+    """Execute one CLI request through the shared builder and receipt layer."""
+    validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    if effective_managed:
+        if not callable(process_runner) or not callable(receipt_sink):
+            raise ValueError(
+                "managed CLI execution requires a process_runner and durable receipt_sink"
             )
-    elif shutil.which("claude") is None:
+    profile = resolve_execution_profile(
+        backend,
+        model,
+        effort,
+        execution_profile=execution_profile,
+        purpose=purpose,
+    )
+    if execution_profile is not None and profile["cli_policy"]["mcp"] == "legacy-disable":
         raise RuntimeError(
-            "Claude Code CLI not found on $PATH. Install from "
-            "https://claude.ai/code and run `claude` once to authenticate."
+            "managed MCP suppression is unavailable without a complete reviewed server set"
         )
 
-    # Deliver the extraction instructions in the USER turn rather than via
-    # --system-prompt. Newer Claude Code CLIs (>= ~2.1) do not treat a
-    # --system-prompt as the sole authority: they still layer in the local
-    # coding-agent context (CLAUDE.md/AGENTS.md in cwd, skills, MCP) and, when
-    # the user turn is only a raw file dump with no request, reply
-    # conversationally ("I see the file, but there's no actual request
-    # attached — what would you like me to do with it?"). That prose parses to
-    # zero nodes/edges, so _response_is_hollow flags it and the chunk is
-    # retried and then failed rather than extracted (verified against Claude
-    # Code 2.1.197). Before #2880 it was misread as truncation and bisected
-    # indefinitely, never converging and never writing graph.json.
-    #
-    # Putting the full extraction schema plus an explicit imperative in the
-    # user turn — and dropping --system-prompt — makes the CLI emit the JSON
-    # object directly. The <untrusted_source> guardrails in _extraction_system
-    # still apply because the schema text is carried verbatim; only its
-    # delivery channel changes.
-    #
-    # When images are present, append the Read-the-paths instruction and
-    # allowlist each containing directory so the CLI's Read tool can open them.
-    add_dir_args: list[str] = []
     if images:
-        user_message = _with_image_notes(user_message, images, with_paths=True)
-        seen_dirs: set[str] = set()
-        for r in images:
-            d = str(r.path.parent)
-            if d not in seen_dirs:
-                seen_dirs.add(d)
-                add_dir_args.extend(["--add-dir", d])
+        prompt = _with_image_notes(prompt, images, with_paths=backend == "claude-cli")
+    if purpose == "extract":
+        prompt = (
+            _extraction_system(deep=deep_mode)
+            + "\n\n---\n"
+            + "Now extract the knowledge graph from the following source file(s) "
+            + "and output ONLY the JSON object described above. No prose, no "
+            + "preamble, no markdown fences.\n\n"
+            + prompt
+        )
 
-    combined_message = (
-        _extraction_system(deep=deep_mode)
-        + "\n\n---\n"
-        + "Now extract the knowledge graph from the following source file(s) "
-        + "and output ONLY the JSON object described above. No prose, no "
-        + "preamble, no markdown fences.\n\n"
-        + user_message
+    attachments = list(prepared_attachments or [])
+    if effective_managed:
+        from graphify.raster import validate_raster_attachment_record
+
+        normalized: list[dict] = []
+        for attachment in attachments:
+            if isinstance(attachment, Mapping) and set(attachment) == {"parent"}:
+                raise ValueError("managed execution requires durable raster attachments")
+            record = validate_raster_attachment_record(attachment)
+            if record["storage_mode"] != "durable":
+                raise ValueError("managed execution requires durable raster attachments")
+            normalized.append(record)
+        attachments = normalized
+        if images and len(attachments) != len(images):
+            raise ValueError("managed execution requires durable raster attachments")
+    elif backend == "claude-cli" and not attachments:
+        attachments = [{"parent": str(ref.path.parent.resolve())} for ref in images or []]
+    actual_cwd = Path(validated_context["cwd"]) if validated_context else Path.cwd()
+    actual_root = Path(validated_context["project_root"]) if validated_context else actual_cwd
+    import shutil as _shutil
+
+    legacy_mcp_args = (
+        _codex_disable_mcp_args(
+            profile["binary_expectation"].get("path") or _shutil.which("codex") or "codex"
+        )
+        if backend == "openai-cli" and not effective_managed
+        else []
     )
-    cli_args = [
-        claude_cmd, "-p",
-        "--output-format", "json",
-        "--no-session-persistence",
-        *add_dir_args,
-    ]
-    # claude-cli defaults to Opus, which is overkill for the structured-JSON
-    # extraction graphify performs. GRAPHIFY_CLAUDE_CLI_MODEL=haiku (or
-    # sonnet, or a full model ID like claude-haiku-4-5-20251001) lets users
-    # opt into a cheaper / faster model. Default behaviour unchanged when
-    # the env var is unset.
-    cli_model = os.environ.get("GRAPHIFY_CLAUDE_CLI_MODEL", "").strip()
-    if cli_model:
-        cli_args.extend(["--model", cli_model])
-    # Constrain the output shape structurally where the CLI supports it. Newer
-    # Claude Code releases increasingly treat a bare file-dump prompt as an
-    # agentic task and REPORT the extraction in prose ("Knowledge graph
-    # extracted — 21 nodes, 20 edges…") instead of returning it; that parses to
-    # zero nodes and reads as hollow (#2076 — and before #2880, as truncation
-    # to be bisected without ever converging). --json-schema pins the shape regardless of
-    # that framing; the user-turn prompt above stays as the fallback for older
-    # CLIs that predate the flag.
-    if _claude_cli_supports_json_schema(claude_cmd):
-        cli_args.extend(["--json-schema", _EXTRACTION_JSON_SCHEMA])
-    proc = subprocess.run(
-        cli_args,
-        input=combined_message,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",  # Force UTF-8 — prevents UnicodeEncodeError on Windows cp1252
-        errors="replace",  # Tolerate non-UTF-8 bytes (e.g. GBK/cp936 from claude.cmd on Chinese Windows)
-        timeout=_resolve_api_timeout(),
-        check=False,
-        **_no_window_kwargs(),
+    import tempfile
+
+    output_path: Path | None = None
+    try:
+        if backend == "openai-cli":
+            output_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+            output_path = Path(output_file.name)
+            output_file.close()
+
+        invocation = build_cli_invocation(
+            prompt,
+            purpose=purpose,
+            max_tokens=max_tokens,
+            deep_mode=deep_mode,
+            attachments=attachments,
+            profile=profile,
+            output_path=output_path,
+            project_root=actual_root,
+            cwd=actual_cwd,
+            legacy_mcp_args=legacy_mcp_args,
+        )
+        if (
+            backend == "claude-cli"
+            and purpose == "extract"
+            and not effective_managed
+            and _claude_cli_supports_json_schema(invocation["argv"][0])
+        ):
+            invocation["argv"].extend(["--json-schema", _EXTRACTION_JSON_SCHEMA])
+        invocation["timeout_seconds"] = _resolve_api_timeout()
+
+        def _parse(process: dict) -> dict:
+            decode_errors = "strict" if effective_managed else "replace"
+            stdout = process["stdout"].decode("utf-8", errors=decode_errors)
+            stderr = process["stderr"].decode("utf-8", errors=decode_errors)
+            if backend == "claude-cli":
+                cli_error = _claude_cli_error(stdout)
+                if process["returncode"] != 0:
+                    detail = stderr.strip() or cli_error or "(no stderr, no error envelope)"
+                    raise RuntimeError(f"claude -p exited {process['returncode']}: {detail[:500]}")
+                if cli_error:
+                    raise RuntimeError(f"claude -p reported an error: {cli_error[:500]}")
+                envelope = _claude_cli_envelope(stdout)
+                structured = envelope.get("structured_output")
+                raw_content = (
+                    json.dumps(structured)
+                    if isinstance(structured, dict)
+                    else envelope.get("result", "")
+                )
+                usage = envelope.get("usage") or {}
+                token_usage = {
+                    "input_tokens": int(usage.get("input_tokens", 0) or 0)
+                    + int(usage.get("cache_read_input_tokens", 0) or 0)
+                    + int(usage.get("cache_creation_input_tokens", 0) or 0),
+                    "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                }
+                model_usage = envelope.get("modelUsage") or {}
+                observations = [{"kind": "model_usage_key", "value": key} for key in model_usage]
+                stop_reason = envelope.get("stop_reason", "")
+            else:
+                if process["returncode"] != 0:
+                    detail = _openai_cli_vendor_detail(stderr, stdout)
+                    raise RuntimeError(f"codex exec exited {process['returncode']}: {detail}")
+                artifact = process["result_artifact"]
+                raw_content = artifact["payload"].decode("utf-8", errors=decode_errors)
+                if not raw_content.strip():
+                    detail = _openai_cli_vendor_detail(stderr, stdout)
+                    raise RuntimeError(f"codex exec produced an empty -o output file: {detail}")
+                input_tokens, output_tokens = _openai_cli_turn_usage(stdout)
+                token_usage = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                }
+                observations = [{"kind": "requested_model", "value": profile["model"]}]
+                stop_reason = ""
+
+            if purpose == "extract":
+                value = _parse_llm_json(raw_content)
+                value.update(token_usage)
+                value["model"] = (
+                    next(iter(model_usage), "claude-code-plan")
+                    if backend == "claude-cli"
+                    else profile["model"]
+                )
+                value["finish_reason"] = "length" if stop_reason == "max_tokens" else "stop"
+                _mark_hollow(value, raw_content, backend)
+                if value["finish_reason"] == "length":
+                    completion = "partial"
+                elif value["finish_reason"] == "hollow":
+                    completion = "hollow"
+                elif not any(value.get(key) for key in ("nodes", "edges", "hyperedges")):
+                    completion = "completed_empty"
+                else:
+                    completion = "completed"
+            else:
+                value = raw_content
+                completion = "completed" if raw_content.strip() else "hollow"
+
+            return {
+                "value": value,
+                "completion": completion,
+                "usage": token_usage,
+                "observations": observations,
+                # Neither currently audited CLI protocol exposes a response ID
+                # joined to the provider-served model. Keep the evidence truthful.
+                "responses": [],
+                "coverage": {
+                    "status": "unproved",
+                    "reasons": ["provider_response_identity_unavailable"],
+                },
+            }
+
+        outcome = run_cli_invocation(
+            invocation,
+            run_context=validated_context,
+            process_runner=process_runner,
+            result_parser=_parse,
+            receipt_sink=receipt_sink,
+        )
+        return outcome
+    finally:
+        if output_path is not None:
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+
+
+def _call_claude_cli(
+    user_message: str,
+    max_tokens: int = 8192,
+    *,
+    deep_mode: bool = False,
+    images: list[_ImageRef] | None = None,
+    prepared_attachments: list[dict] | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
+) -> dict:
+    """Call Claude through the shared CLI invocation and receipt layer."""
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
     )
-    cli_error = _claude_cli_error(proc.stdout)
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or cli_error or "(no stderr, no error envelope)"
-        raise RuntimeError(f"claude -p exited {proc.returncode}: {detail[:500]}")
-    if cli_error:
-        raise RuntimeError(f"claude -p reported an error: {cli_error[:500]}")
+    selected_model = model
+    selected_effort = effort
+    if execution_profile is None:
+        selected_model = model or os.environ.get("GRAPHIFY_CLAUDE_CLI_MODEL", "").strip() or None
+        selected_effort = effort or os.environ.get("GRAPHIFY_CLAUDE_CLI_EFFORT", "").strip() or None
+    outcome = _managed_cli_call(
+        user_message,
+        backend="claude-cli",
+        purpose="extract",
+        max_tokens=max_tokens,
+        deep_mode=deep_mode,
+        images=images,
+        prepared_attachments=prepared_attachments,
+        model=selected_model,
+        effort=selected_effort,
+        execution_profile=execution_profile,
+        run_context=run_context,
+        process_runner=process_runner,
+        receipt_sink=receipt_sink,
+    )
+    result = outcome["value"]
+    if effective_managed:
+        result.setdefault("_execution_receipts", []).append(outcome["receipt"])
+    return result
 
-    envelope = _claude_cli_envelope(proc.stdout)
 
-    # When --json-schema is in effect the CLI puts the CONSTRAINED object in the
-    # `structured_output` envelope field; `result` stays the model's discretionary
-    # text, which on a "reporting" turn is prose even with the flag set (verified
-    # live on Claude Code 2.1.185). Prefer the structured channel and route it
-    # through the same _parse_llm_json normalizer; fall back to parsing `result`
-    # for older CLIs that don't emit structured_output (#2076 review).
-    structured = envelope.get("structured_output")
-    if isinstance(structured, dict):
-        raw_content = json.dumps(structured)
+# In-process memoization for the openai-cli MCP-disable path. `codex mcp list
+# --json` alone measures ~1.25s on this machine, and a mixed-resolvability list
+# (some names resolve here, some don't) needs up to N+2 subprocess spawns to
+# sort out -- ~15s measured with 10 configured servers, 6 of them unresolvable.
+# `_codex_disable_mcp_args` runs once per `codex exec`, i.e. once per chunk, so
+# an unmemoized extraction pays that on every single chunk for an answer that
+# cannot change mid-run. Keyed on (codex_cmd, cwd[, names]) because premise P2
+# showed the SAME override for the SAME name resolves differently depending on
+# the working directory -- a cache blind to cwd would hand a later call an
+# answer derived somewhere else; the resolve cache additionally keys on the
+# name TUPLE so a listing that changes mid-process cannot replay a stale
+# verdict for a different set. Scoped to this process only: no disk, no
+# cross-process state, never invalidated within it -- entirely acceptable
+# because the MCP config a single `codex` install reports for a single cwd is
+# not expected to change over the life of one graphify run. Tests reset these
+# via monkeypatch; production code never clears them.
+_CODEX_MCP_NAMES_CACHE: dict[tuple[str, str], list[str]] = {}
+_CODEX_MCP_RESOLVE_CACHE: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
+
+
+def _codex_mcp_server_names(codex_cmd: str, cwd: str) -> list[str]:
+    """Every MCP server name `codex mcp list --json` reports for `cwd`, filtered
+    to the charset a bare TOML table key holds without quoting (alnum, `-`, `_`)
+    -- the same filter the disable-override path has always applied. Best
+    effort: a missing Codex, a non-zero exit, or unparsable JSON all return []
+    rather than raise, matching `codex mcp list`'s own failure posture.
+
+    Memoized per (codex_cmd, cwd) in `_CODEX_MCP_NAMES_CACHE` -- see the module
+    comment above it for why this is safe to never invalidate within a process.
+    """
+    cache_key = (codex_cmd, cwd)
+    try:
+        cached = _CODEX_MCP_NAMES_CACHE[cache_key]
+    except KeyError:
+        cached = None
+    if cached is not None:
+        return cached
+
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [codex_cmd, "mcp", "list", "--json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False, cwd=cwd, **_no_window_kwargs(),
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            names: list[str] = []
+        else:
+            servers = json.loads(proc.stdout)
+            names = []
+            for entry in servers if isinstance(servers, list) else []:
+                name = (entry or {}).get("name") if isinstance(entry, dict) else None
+                if isinstance(name, str) and name and all(ch.isalnum() or ch in "-_" for ch in name):
+                    names.append(name)
+    except Exception:
+        names = []
+
+    _CODEX_MCP_NAMES_CACHE[cache_key] = names
+    return names
+
+
+def _codex_resolvable_disable_args(codex_cmd: str, cwd: str, names: list[str]) -> list[str]:
+    """`-c mcp_servers.<name>.enabled=false` for every name in `names` Codex can
+    actually resolve for `cwd` -- reusable by any future `codex exec` call site
+    that has its own name list, not only the one below.
+
+    `codex mcp list --json` reporting a name is not the same as that name being a
+    `[mcp_servers.<name>]` table in any config Codex merges here: a plugin-provided
+    server, or one defined only in another repo's config, reports but resolves
+    nowhere. Overriding `.enabled` on a name with no real table creates one with
+    neither `command` nor `url`, and Codex rejects its ENTIRE bootstrap
+    configuration for that -- taking every other override down with it, and the
+    whole `codex exec` call with it. `disabled_reason` and `transport.type` from
+    the listing do not discriminate this: resolvability is a property of the
+    working directory, not of the server's own entry. The only honest check is
+    asking Codex, with the same lightweight subcommand (`mcp list --json`, no
+    model call) the caller already pays for -- never `codex exec`, never a read
+    of Codex's own config files.
+
+    One combined probe (every name at once) covers the common case -- everything
+    configured resolves here -- for the cost of one extra bounded subprocess call.
+    Only when that combined probe fails does this fall back to one probe per
+    remaining name, bounded by however many names Codex itself listed (single
+    digits to low tens in practice). Any uncertainty -- a probe that errors or
+    times out -- excludes that name rather than including it: failing to disable
+    an optimisation is always preferable to failing the run.
+
+    Per-name resolvability is not the same guarantee as resolvability of the
+    SET those survivors form together -- that is what gets returned, so that is
+    what gets validated: once the fallback has its candidate list, it probes
+    that exact list as a whole before emitting it, and returns [] rather than
+    an unvalidated list if the assembled set is rejected. This costs nothing
+    when nothing survived (there is nothing to validate) and nothing on the
+    combined-probe success path above (that list was already validated as a
+    whole by construction).
+
+    Memoized per (codex_cmd, cwd, tuple(names)) in `_CODEX_MCP_RESOLVE_CACHE` --
+    see the module comment above `_codex_mcp_server_names` for the scope and
+    invalidation policy this shares.
+    """
+    if not names:
+        return []
+
+    cache_key = (codex_cmd, cwd, tuple(names))
+    try:
+        cached = _CODEX_MCP_RESOLVE_CACHE[cache_key]
+    except KeyError:
+        cached = None
+    if cached is not None:
+        return cached
+
+    import subprocess
+
+    def _disable_args(candidates: list[str]) -> list[str]:
+        out: list[str] = []
+        for n in candidates:
+            out += ["-c", f"mcp_servers.{n}.enabled=false"]
+        return out
+
+    def _resolves(candidates: list[str]) -> bool:
+        try:
+            proc = subprocess.run(
+                [codex_cmd, "mcp", "list", "--json", *_disable_args(candidates)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30, check=False, cwd=cwd, **_no_window_kwargs(),
+            )
+        except Exception:
+            return False
+        return proc.returncode == 0
+
+    if _resolves(names):
+        result = _disable_args(names)
+    elif len(names) == 1:
+        # The combined probe above WAS the only probe possible for one name.
+        result = []
     else:
-        raw_content = envelope.get("result", "")
-    result = _parse_llm_json(raw_content or "{}")
-    usage = envelope.get("usage") or {}
-    result["input_tokens"] = (
-        int(usage.get("input_tokens", 0) or 0)
-        + int(usage.get("cache_read_input_tokens", 0) or 0)
-        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+        # Each survivor here passed ALONE. That does not prove the SET they
+        # form together is accepted -- and the set is exactly what this
+        # function is about to hand back. Validate the assembled survivor
+        # list itself, once, before returning it: an unvalidated emission is
+        # the bug this whole function exists to prevent, reached by a longer
+        # route (individually-safe names whose combination Codex rejects).
+        # An empty survivor set has nothing to validate and costs no probe.
+        survivors = [n for n in names if _resolves([n])]
+        result = _disable_args(survivors) if survivors and _resolves(survivors) else []
+
+    _CODEX_MCP_RESOLVE_CACHE[cache_key] = result
+    return result
+
+
+def _codex_disable_mcp_args(codex_cmd: str) -> list[str]:
+    """`-c mcp_servers.<name>.enabled=false` for every server Codex has configured
+    AND can actually resolve for the current working directory.
+
+    Extraction never calls a tool, and each configured MCP server is started per
+    `codex exec` invocation. Codex config overrides deep-merge, so a blanket
+    `-c mcp_servers={}` leaves the servers enabled; its per-server `enabled` field
+    (visible in `codex mcp get <name>`) is the switch that works. The server list
+    comes from `codex mcp list --json`, so no server name is hardcoded. Best
+    effort, and the effort is wider than just "Codex is unavailable": if listing
+    fails, if a name cannot be confirmed resolvable, or if any probe this adds
+    errors, extraction proceeds with whatever the user configured for that name
+    rather than risking the whole call on an override that might not apply.
+
+    Both underlying lookups are memoized per (codex_cmd, cwd) for the life of
+    this process -- see `_CODEX_MCP_NAMES_CACHE` above -- so only the FIRST
+    `codex exec` in a run pays for the listing and the resolvability probes;
+    every later call in the same run and working directory returns instantly.
+    """
+    cwd = os.getcwd()
+    return _codex_resolvable_disable_args(codex_cmd, cwd, _codex_mcp_server_names(codex_cmd, cwd))
+
+
+def _call_openai_cli(
+    user_message: str,
+    max_tokens: int = 8192,
+    *,
+    deep_mode: bool = False,
+    images: list[_ImageRef] | None = None,
+    prepared_attachments: list[dict] | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
+) -> dict:
+    """Call OpenAI through the shared Codex invocation and receipt layer."""
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
     )
-    result["output_tokens"] = int(usage.get("output_tokens", 0) or 0)
-    model_usage = envelope.get("modelUsage") or {}
-    result["model"] = next(iter(model_usage), "claude-code-plan")
-    stop_reason = envelope.get("stop_reason", "")
-    result["finish_reason"] = "length" if stop_reason == "max_tokens" else "stop"
-    _mark_hollow(result, raw_content, "claude-cli")
+    selected_model = model
+    selected_effort = effort
+    if execution_profile is None:
+        selected_model = (
+            model or os.environ.get("GRAPHIFY_OPENAI_CLI_MODEL", "").strip() or "gpt-5.6-sol"
+        )
+        selected_effort = (
+            effort or os.environ.get("GRAPHIFY_OPENAI_CLI_EFFORT", "").strip() or "ultra"
+        )
+    outcome = _managed_cli_call(
+        user_message,
+        backend="openai-cli",
+        purpose="extract",
+        max_tokens=max_tokens,
+        deep_mode=deep_mode,
+        images=images,
+        prepared_attachments=prepared_attachments,
+        model=selected_model,
+        effort=selected_effort,
+        execution_profile=execution_profile,
+        run_context=run_context,
+        process_runner=process_runner,
+        receipt_sink=receipt_sink,
+    )
+    result = outcome["value"]
+    if effective_managed:
+        result.setdefault("_execution_receipts", []).append(outcome["receipt"])
     return result
 
 
@@ -1890,6 +2578,14 @@ def extract_files_direct(
     root: Path = Path("."),
     *,
     deep_mode: bool = False,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
+    attachment_stager: Callable[[dict], Mapping] | None = None,
+    attachment_snapshot_root: Path | None = None,
+    _prepared_raster_request: Mapping | None = None,
 ) -> dict:
     """Extract semantic nodes/edges from a list of files using the given backend.
 
@@ -1903,7 +2599,19 @@ def extract_files_direct(
     (from extract_corpus_parallel's oversized-doc slicing, #1369) pass through
     untouched — Path(FileSlice) would raise (#1397/#1399).
     """
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    if execution_profile is not None:
+        resolved_profile = resolve_execution_profile(
+            backend, model, effort, execution_profile=execution_profile, purpose="extract"
+        )
+        backend = resolved_profile["backend"]
+        model = resolved_profile["model"]
+        effort = resolved_profile["effort"]
     files = [f if isinstance(f, (Path, FileSlice)) else Path(f) for f in files]
+    if effective_managed and backend not in {"claude-cli", "openai-cli"}:
+        raise ValueError("capture-required execution requires a registered CLI backend")
     if backend is None:
         backend = detect_backend()
         if backend is None:
@@ -1915,6 +2623,44 @@ def extract_files_direct(
             )
     if backend not in BACKENDS:
         raise ValueError(f"Unknown backend {backend!r}. Available: {sorted(BACKENDS)}")
+    image_files = [unit for unit in files if isinstance(unit, Path) and _is_vision_image(unit)]
+    if _prepared_raster_request is None:
+        from graphify.raster import MAX_DIRECT_RASTERS, RasterPreflightError
+
+        if len(image_files) > MAX_DIRECT_RASTERS:
+            raise RasterPreflightError(
+                "too_many_images",
+                f"direct extraction accepts at most {MAX_DIRECT_RASTERS} raster images",
+                image_count=len(image_files),
+                max_images=MAX_DIRECT_RASTERS,
+            )
+    if image_files and _prepared_raster_request is None:
+        with _prepare_cli_raster_attachments(
+            [files],
+            backend=backend,
+            root=root,
+            execution_profile=execution_profile,
+            run_context=run_context,
+            attachment_stager=attachment_stager,
+            attachment_snapshot_root=attachment_snapshot_root,
+        ) as prepared:
+            result = extract_files_direct(
+                files,
+                backend=backend,
+                api_key=api_key,
+                model=model,
+                root=root,
+                deep_mode=deep_mode,
+                effort=effort,
+                execution_profile=execution_profile,
+                run_context=run_context,
+                process_runner=process_runner,
+                receipt_sink=receipt_sink,
+                attachment_stager=attachment_stager,
+                attachment_snapshot_root=attachment_snapshot_root,
+                _prepared_raster_request=prepared,
+            )
+        return _attach_raster_evidence(result, prepared)
 
     cfg = BACKENDS[backend]
     key = api_key or _get_backend_api_key(backend)
@@ -1931,7 +2677,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "openai-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -1943,20 +2689,99 @@ def extract_files_direct(
     text_files, image_files = _partition_semantic_files(files)
     user_msg = _read_files(text_files, root)
     vision = _backend_supports_vision(backend)
+    if image_files and not vision and backend != "openai-cli":
+        from graphify.raster import RasterPreflightError
+
+        raise RasterPreflightError(
+            "transport_unsupported",
+            "selected backend does not support raster transport",
+            backend=backend,
+        )
     # Only base64 (inline) vision backends need the bytes loaded + size-capped;
     # path-based backends (claude-cli) and non-vision backends do not.
     read_bytes = vision and backend not in _PATH_IMAGE_BACKENDS
-    image_refs = _build_image_refs(image_files, root, read_bytes=read_bytes) if image_files else []
-    if image_refs and not vision:
+    image_refs = (
+        _build_image_refs(image_files, root, read_bytes=read_bytes, strict=True)
+        if image_files
+        else []
+    )
+    if read_bytes and _prepared_raster_request:
+        from graphify.raster import RasterPreflightError
+
+        sources_by_path = _prepared_raster_request["source_records_by_path"]
+        for ref in image_refs:
+            expected = sources_by_path.get(str(ref.path))
+            original = expected.get("original_source") if isinstance(expected, Mapping) else None
+            if (
+                not isinstance(original, Mapping)
+                or ref.raw is None
+                or len(ref.raw) != original.get("byte_count")
+                or hashlib.sha256(ref.raw).hexdigest() != original.get("sha256")
+            ):
+                raise RasterPreflightError(
+                    "source_changed",
+                    "raster source bytes changed after preflight",
+                    source_path=str(ref.path),
+                )
+    if image_refs and not vision and backend != "openai-cli":
         image_refs = _strip_pixels(image_refs)
+    prepared_attachments = []
+    if image_files and _prepared_raster_request:
+        by_path = _prepared_raster_request["attachments_by_path"]
+        prepared_attachments = [
+            by_path[str(ref.path)] for ref in image_refs if str(ref.path) in by_path
+        ]
+        if backend == "openai-cli" and len(prepared_attachments) != len(image_files):
+            raise ValueError("Codex raster attachment preparation is incomplete")
+        if prepared_attachments:
+            transport_by_path = {
+                item["original_source"]["canonical_path"]: Path(
+                    item["staged_bytes"]["transport_path"]
+                )
+                for item in prepared_attachments
+            }
+            image_refs = [
+                replace(ref, path=transport_by_path.get(str(ref.path), ref.path))
+                for ref in image_refs
+            ]
     max_out = _resolve_max_tokens(cfg.get("max_tokens", 8192))
 
     if backend == "claude":
-        result = _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+        result = _call_claude(
+            key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs
+        )
     elif backend == "claude-cli":
-        result = _call_claude_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+        result = _call_claude_cli(
+            user_msg,
+            max_tokens=max_out,
+            deep_mode=deep_mode,
+            images=image_refs,
+            prepared_attachments=prepared_attachments,
+            model=model,
+            effort=effort,
+            execution_profile=execution_profile,
+            run_context=run_context,
+            process_runner=process_runner,
+            receipt_sink=receipt_sink,
+        )
+    elif backend == "openai-cli":
+        result = _call_openai_cli(
+            user_msg,
+            max_tokens=max_out,
+            deep_mode=deep_mode,
+            images=image_refs,
+            prepared_attachments=prepared_attachments,
+            model=model,
+            effort=effort,
+            execution_profile=execution_profile,
+            run_context=run_context,
+            process_runner=process_runner,
+            receipt_sink=receipt_sink,
+        )
     elif backend == "bedrock":
-        result = _call_bedrock(mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+        result = _call_bedrock(
+            mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs
+        )
     elif backend == "azure":
         endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
         if not endpoint:
@@ -2009,7 +2834,7 @@ def extract_files_direct(
                 )
         except Exception as _exc:  # noqa: BLE001 — evidence-binding is advisory
             print(f"[graphify] evidence-binding skipped: {_exc}", file=sys.stderr)
-    return result
+    return _attach_raster_evidence(result, _prepared_raster_request)
 
 
 # Estimating a PDF means extracting its text, and packing asks for the same
@@ -2265,6 +3090,14 @@ def _extract_with_adaptive_retry(
     _depth: int = 0,
     *,
     deep_mode: bool = False,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
+    attachment_stager: Callable[[dict], Mapping] | None = None,
+    attachment_snapshot_root: Path | None = None,
+    _prepared_raster_request: Mapping | None = None,
 ) -> dict:
     """Extract a chunk; if the response is truncated (`finish_reason="length"`),
     the API rejects the prompt as too large for the model's context window, or
@@ -2308,22 +3141,142 @@ def _extract_with_adaptive_retry(
     non-splittable file (e.g. one huge code file) can't be made smaller than
     itself, so we return what we got and warn.
     """
-    def _merge_two(left_units, right_units) -> dict:
-        left = _extract_with_adaptive_retry(
-            left_units, backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+    forward = {
+        "deep_mode": deep_mode,
+        "effort": effort,
+        "execution_profile": execution_profile,
+        "run_context": run_context,
+        "process_runner": process_runner,
+        "receipt_sink": receipt_sink,
+        "attachment_stager": attachment_stager,
+        "attachment_snapshot_root": attachment_snapshot_root,
+        "_prepared_raster_request": _prepared_raster_request,
+    }
+
+    def _unique_receipts(*groups) -> list[dict]:
+        merged_receipts: list[dict] = []
+        seen: set[str] = set()
+        for group in groups:
+            for receipt in group or []:
+                receipt_id = receipt.get("receipt_id") if isinstance(receipt, dict) else None
+                key = receipt_id or json.dumps(receipt, sort_keys=True, default=str)
+                if key not in seen:
+                    seen.add(key)
+                    merged_receipts.append(receipt)
+        return merged_receipts
+
+    def _attempt_receipts(exc: BaseException) -> list[dict]:
+        attempt = getattr(exc, "graphify_attempt", None)
+        receipt = attempt.get("receipt") if isinstance(attempt, dict) else None
+        return [receipt] if isinstance(receipt, dict) else []
+
+    def _receipt_usage(receipts: list[dict]) -> tuple[int, int]:
+        return (
+            sum(
+                int((receipt.get("usage") or {}).get("input_tokens", 0) or 0)
+                for receipt in receipts
+            ),
+            sum(
+                int((receipt.get("usage") or {}).get("output_tokens", 0) or 0)
+                for receipt in receipts
+            ),
         )
-        right = _extract_with_adaptive_retry(
-            right_units, backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
-        )
+
+    def _merge_two(
+        left_units,
+        right_units,
+        *,
+        prior_receipts: list[dict] | None = None,
+        prior_input: int = 0,
+        prior_output: int = 0,
+    ) -> dict:
+        try:
+            left = _extract_with_adaptive_retry(
+                left_units, backend, api_key, model, root, max_depth, _depth + 1, **forward
+            )
+        except BaseException as exc:
+            existing = getattr(exc, "graphify_partial_result", None)
+            if not isinstance(existing, dict):
+                failed_receipts = _attempt_receipts(exc)
+                failed_input, failed_output = _receipt_usage(failed_receipts)
+                existing = {
+                    "nodes": [],
+                    "edges": [],
+                    "hyperedges": [],
+                    "input_tokens": failed_input,
+                    "output_tokens": failed_output,
+                    "_execution_receipts": failed_receipts,
+                    "_partial_files": _chunk_partial_files(left_units),
+                }
+            existing["input_tokens"] = prior_input + existing.get("input_tokens", 0)
+            existing["output_tokens"] = prior_output + existing.get("output_tokens", 0)
+            existing["_execution_receipts"] = _unique_receipts(
+                prior_receipts, existing.get("_execution_receipts")
+            )
+            existing["_partial_files"] = sorted(
+                set(existing.get("_partial_files", []) or [])
+                | set(_chunk_partial_files([*left_units, *right_units]))
+            )
+            exc.__dict__["graphify_partial_result"] = existing
+            raise
+        try:
+            right = _extract_with_adaptive_retry(
+                right_units, backend, api_key, model, root, max_depth, _depth + 1, **forward
+            )
+        except BaseException as exc:
+            right_partial = getattr(exc, "graphify_partial_result", None)
+            if not isinstance(right_partial, dict):
+                right_receipts = _attempt_receipts(exc)
+                right_input, right_output = _receipt_usage(right_receipts)
+                right_partial = {
+                    "nodes": [],
+                    "edges": [],
+                    "hyperedges": [],
+                    "input_tokens": right_input,
+                    "output_tokens": right_output,
+                    "_execution_receipts": right_receipts,
+                    "_partial_files": _chunk_partial_files(right_units),
+                }
+            partial = {
+                "nodes": left.get("nodes", []) + right_partial.get("nodes", []),
+                "edges": left.get("edges", []) + right_partial.get("edges", []),
+                "hyperedges": left.get("hyperedges", []) + right_partial.get("hyperedges", []),
+                "input_tokens": prior_input
+                + left.get("input_tokens", 0)
+                + right_partial.get("input_tokens", 0),
+                "output_tokens": prior_output
+                + left.get("output_tokens", 0)
+                + right_partial.get("output_tokens", 0),
+                "model": model,
+                "_execution_receipts": _unique_receipts(
+                    prior_receipts,
+                    left.get("_execution_receipts"),
+                    right_partial.get("_execution_receipts"),
+                ),
+            }
+            partial["_partial_files"] = sorted(
+                set(left.get("_partial_files", []) or [])
+                | set(right_partial.get("_partial_files", []) or [])
+                | set(_chunk_partial_files(right_units))
+            )
+            exc.__dict__["graphify_partial_result"] = partial
+            raise
         return {
             "nodes": left.get("nodes", []) + right.get("nodes", []),
             "edges": left.get("edges", []) + right.get("edges", []),
             "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
-            "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
-            "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
+            "input_tokens": prior_input
+            + left.get("input_tokens", 0)
+            + right.get("input_tokens", 0),
+            "output_tokens": prior_output
+            + left.get("output_tokens", 0)
+            + right.get("output_tokens", 0),
             "model": model,
             "finish_reason": "stop",
             "_partial_files": _merged_partial_files(left, right),
+            "_execution_receipts": _unique_receipts(
+                prior_receipts, left.get("_execution_receipts"), right.get("_execution_receipts")
+            ),
         }
 
     def _split_lone_slice() -> "tuple[FileSlice, FileSlice] | None":
@@ -2335,7 +3288,7 @@ def _extract_with_adaptive_retry(
 
     try:
         result = extract_files_direct(
-            chunk, backend=backend, api_key=api_key, model=model, root=root, deep_mode=deep_mode
+            chunk, backend=backend, api_key=api_key, model=model, root=root, **forward
         )
         # A hollow response is retried as-is, with backoff — see _mark_hollow.
         # Bounded by a fixed number of attempts, so one misbehaving backend
@@ -2346,7 +3299,7 @@ def _extract_with_adaptive_retry(
         # so it has to hold for the hollow path too: one call per chunk, full
         # stop. Bounding only the bisection depth would still let a misbehaving
         # backend triple the call count of a run that asked for no retries.
-        for _delay in (_HOLLOW_BACKOFF_S if max_depth > 0 else ()):
+        for _delay in _HOLLOW_BACKOFF_S if max_depth > 0 else ():
             if result.get("finish_reason") != "hollow":
                 break
             print(
@@ -2354,15 +3307,30 @@ def _extract_with_adaptive_retry(
                 f"after a hollow response",
                 file=sys.stderr,
             )
-            time.sleep(_delay)
-            result = extract_files_direct(
-                chunk, backend=backend, api_key=api_key, model=model, root=root, deep_mode=deep_mode
+            prior = result
+            try:
+                time.sleep(_delay)
+                result = extract_files_direct(
+                    chunk, backend=backend, api_key=api_key, model=model, root=root, **forward
+                )
+            except BaseException as exc:
+                prior["_partial_files"] = sorted(
+                    set(prior.get("_partial_files", []) or []) | set(_chunk_partial_files(chunk))
+                )
+                exc.__dict__["graphify_partial_result"] = prior
+                raise
+            result["input_tokens"] = prior.get("input_tokens", 0) + result.get("input_tokens", 0)
+            result["output_tokens"] = prior.get("output_tokens", 0) + result.get("output_tokens", 0)
+            result["_execution_receipts"] = _unique_receipts(
+                prior.get("_execution_receipts"), result.get("_execution_receipts")
             )
     except Exception as exc:  # noqa: BLE001 — re-raise unless it's a known context overflow or timeout
         is_timeout = _looks_like_timeout(exc)
         if not (_looks_like_context_exceeded(exc) or is_timeout):
             raise
         reason = "timed out" if is_timeout else "exceeded context"
+        failed_receipts = _attempt_receipts(exc)
+        failed_input, failed_output = _receipt_usage(failed_receipts)
         if len(chunk) <= 1:
             halves = _split_lone_slice()
             if halves is not None:
@@ -2371,14 +3339,30 @@ def _extract_with_adaptive_retry(
                     f"depth {_depth}; splitting the slice and retrying",
                     file=sys.stderr,
                 )
-                return _merge_two([halves[0]], [halves[1]])
+                return _merge_two(
+                    [halves[0]],
+                    [halves[1]],
+                    prior_receipts=failed_receipts,
+                    prior_input=failed_input,
+                    prior_output=failed_output,
+                )
             fail_desc = "timed out" if is_timeout else "exceeds model context"
             print(
                 f"[graphify] single-file chunk {unit_path(chunk[0])} {fail_desc} "
                 f"and cannot be split further: {exc}",
                 file=sys.stderr,
             )
-            return {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0, "model": model, "finish_reason": "stop"}
+            return {
+                "nodes": [],
+                "edges": [],
+                "hyperedges": [],
+                "input_tokens": failed_input,
+                "output_tokens": failed_output,
+                "model": model,
+                "finish_reason": "stop",
+                "_execution_receipts": failed_receipts,
+                "_partial_files": _chunk_partial_files(chunk),
+            }
         if _depth >= max_depth:
             persist_desc = "still times out" if is_timeout else "still overflows context"
             print(
@@ -2386,29 +3370,30 @@ def _extract_with_adaptive_retry(
                 f"recursion depth {_depth} (max {max_depth}) — dropping",
                 file=sys.stderr,
             )
-            return {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0, "model": model, "finish_reason": "stop"}
+            return {
+                "nodes": [],
+                "edges": [],
+                "hyperedges": [],
+                "input_tokens": failed_input,
+                "output_tokens": failed_output,
+                "model": model,
+                "finish_reason": "stop",
+                "_execution_receipts": failed_receipts,
+                "_partial_files": _chunk_partial_files(chunk),
+            }
         print(
             f"[graphify] chunk of {len(chunk)} {reason} at depth "
             f"{_depth} ({type(exc).__name__}); splitting in half and retrying",
             file=sys.stderr,
         )
         mid = len(chunk) // 2
-        left = _extract_with_adaptive_retry(
-            chunk[:mid], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+        return _merge_two(
+            chunk[:mid],
+            chunk[mid:],
+            prior_receipts=failed_receipts,
+            prior_input=failed_input,
+            prior_output=failed_output,
         )
-        right = _extract_with_adaptive_retry(
-            chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
-        )
-        return {
-            "nodes": left.get("nodes", []) + right.get("nodes", []),
-            "edges": left.get("edges", []) + right.get("edges", []),
-            "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
-            "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
-            "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-            "model": model,
-            "finish_reason": "stop",
-            "_partial_files": _merged_partial_files(left, right),
-        }
 
     if result.get("finish_reason") == "hollow":
         # Still hollow after every retry. Fail the chunk loudly rather than
@@ -2442,7 +3427,13 @@ def _extract_with_adaptive_retry(
                 f"splitting the slice and retrying",
                 file=sys.stderr,
             )
-            return _merge_two([halves[0]], [halves[1]])
+            return _merge_two(
+                [halves[0]],
+                [halves[1]],
+                prior_receipts=result.get("_execution_receipts"),
+                prior_input=result.get("input_tokens", 0),
+                prior_output=result.get("output_tokens", 0),
+            )
         print(
             f"[graphify] single-file chunk {unit_path(chunk[0])} truncated at "
             f"max_completion_tokens — partial result kept (not cached as complete)",
@@ -2481,31 +3472,18 @@ def _extract_with_adaptive_retry(
         file=sys.stderr,
     )
     mid = len(chunk) // 2
-    left = _extract_with_adaptive_retry(
-        chunk[:mid], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+    return _merge_two(
+        chunk[:mid],
+        chunk[mid:],
+        prior_receipts=result.get("_execution_receipts"),
+        prior_input=result.get("input_tokens", 0),
+        prior_output=result.get("output_tokens", 0),
     )
-    right = _extract_with_adaptive_retry(
-        chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
-    )
-
-    return {
-        "nodes": left.get("nodes", []) + right.get("nodes", []),
-        "edges": left.get("edges", []) + right.get("edges", []),
-        "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
-        "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
-        "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-        "model": result.get("model"),
-        # Both halves either succeeded or have already surfaced their own
-        # truncation warning; the merged result is no longer truncated as a
-        # logical unit.
-        "finish_reason": "stop",
-        "_partial_files": _merged_partial_files(left, right),
-    }
 
 
 def extract_corpus_parallel(
     files: list[Path],
-    backend: str = "kimi",
+    backend: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
     root: Path = Path("."),
@@ -2516,6 +3494,16 @@ def extract_corpus_parallel(
     max_retry_depth: int | None = None,
     deep_mode: bool = False,
     cache_root: "Path | None" = None,
+    *,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
+    attachment_stager: Callable[[dict], Mapping] | None = None,
+    attachment_snapshot_root: Path | None = None,
+    attachment_compatibility: Mapping[str, str] | None = None,
+    _prepared_raster_request: Mapping | None = None,
 ) -> dict:
     """Extract a corpus in chunks, merging results.
 
@@ -2568,9 +3556,27 @@ def extract_corpus_parallel(
     Accepts ``str`` paths as well as ``Path``; string entries are coerced up
     front so packing/slicing helpers can rely on ``Path`` semantics (#1386).
     """
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    if execution_profile is not None:
+        resolved_profile = resolve_execution_profile(
+            backend, model, effort, execution_profile=execution_profile, purpose="extract"
+        )
+        backend = resolved_profile["backend"]
+        model = resolved_profile["model"]
+        effort = resolved_profile["effort"]
+    elif effective_managed:
+        if backend not in ("claude-cli", "openai-cli"):
+            raise ValueError("capture-required execution requires a registered CLI backend")
+    elif backend is None:
+        backend = "kimi"
+    if effective_managed and backend not in ("claude-cli", "openai-cli"):
+        raise ValueError("capture-required execution requires a registered CLI backend")
     if max_retry_depth is None:
         max_retry_depth = _resolve_max_retry_depth()
     files = [f if isinstance(f, (Path, FileSlice)) else Path(f) for f in files]
+    original_files = list(files)
     # Split oversized splittable documents into slices that cover the whole file
     # before packing, so content past _FILE_CHAR_CAP is extracted instead of
     # silently dropped (#1369). Files at/under the cap pass through unchanged.
@@ -2578,16 +3584,72 @@ def extract_corpus_parallel(
     if token_budget is not None:
         chunks = _pack_chunks_by_tokens(files, token_budget=token_budget)
     else:
-        chunks = [files[i:i + chunk_size] for i in range(0, len(files), chunk_size)]
+        chunks = [files[i : i + chunk_size] for i in range(0, len(files), chunk_size)]
+    chunks = _split_chunks_by_raster_limit(chunks)
+
+    has_rasters = any(
+        isinstance(unit, Path) and _is_vision_image(unit) for chunk in chunks for unit in chunk
+    )
+    if has_rasters and _prepared_raster_request is None:
+        with _prepare_cli_raster_attachments(
+            chunks,
+            backend=backend,
+            root=root,
+            execution_profile=execution_profile,
+            run_context=run_context,
+            attachment_stager=attachment_stager,
+            attachment_snapshot_root=attachment_snapshot_root,
+        ) as prepared:
+            if attachment_compatibility is not None:
+                current_compatibility = prepared["attachment_compatibility"]
+                if any(
+                    attachment_compatibility.get(path) != fingerprint
+                    for path, fingerprint in current_compatibility.items()
+                ):
+                    from graphify.raster import RasterPreflightError
+
+                    raise RasterPreflightError(
+                        "source_changed",
+                        "raster attachment compatibility changed after cache admission",
+                    )
+            result = extract_corpus_parallel(
+                original_files,
+                backend=backend,
+                api_key=api_key,
+                model=model,
+                root=root,
+                chunk_size=chunk_size,
+                on_chunk_done=on_chunk_done,
+                token_budget=token_budget,
+                max_concurrency=max_concurrency,
+                max_retry_depth=max_retry_depth,
+                deep_mode=deep_mode,
+                cache_root=cache_root,
+                effort=effort,
+                execution_profile=execution_profile,
+                run_context=run_context,
+                process_runner=process_runner,
+                receipt_sink=receipt_sink,
+                attachment_stager=attachment_stager,
+                attachment_snapshot_root=attachment_snapshot_root,
+                attachment_compatibility=attachment_compatibility,
+                _prepared_raster_request=prepared,
+            )
+        return _attach_raster_evidence(result, prepared)
 
     merged: dict = {
-        "nodes": [], "edges": [], "hyperedges": [],
-        "input_tokens": 0, "output_tokens": 0,
+        "nodes": [],
+        "edges": [],
+        "hyperedges": [],
+        "input_tokens": 0,
+        "output_tokens": 0,
         "failed_chunks": 0,  # count of chunks that raised — loud failure on chunk errors
     }
     total = len(chunks)
 
-    def _run_one(idx: int, chunk: list[Path]) -> tuple[int, dict | None, Exception | None]:
+    def _run_one(idx: int, chunk: list[Path]) -> tuple[int, dict | None, BaseException | None]:
+        from graphify.raster import RasterPreflightError
+
         t0 = time.time()
         try:
             result = _extract_with_adaptive_retry(
@@ -2598,11 +3660,34 @@ def extract_corpus_parallel(
                 root=root,
                 max_depth=max_retry_depth,
                 deep_mode=deep_mode,
+                effort=effort,
+                execution_profile=execution_profile,
+                run_context=run_context,
+                process_runner=process_runner,
+                receipt_sink=receipt_sink,
+                attachment_stager=attachment_stager,
+                attachment_snapshot_root=attachment_snapshot_root,
+                _prepared_raster_request=_prepared_raster_request,
             )
             result["elapsed_seconds"] = round(time.time() - t0, 2)
             return idx, result, None
-        except Exception as exc:  # noqa: BLE001 — caller-facing surface, log + continue
-            return idx, None, exc
+        except RasterPreflightError:
+            raise
+        except BaseException as exc:  # preserve cancellation evidence before propagation
+            partial = getattr(exc, "graphify_partial_result", None)
+            if not isinstance(partial, dict):
+                attempt = getattr(exc, "graphify_attempt", None)
+                receipt = attempt.get("receipt") if isinstance(attempt, dict) else None
+                partial = {
+                    "nodes": [],
+                    "edges": [],
+                    "hyperedges": [],
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "_execution_receipts": [receipt] if isinstance(receipt, dict) else [],
+                    "_partial_files": _chunk_partial_files(chunk),
+                }
+            return idx, partial, exc
 
     # Ollama serves one request at a time per loaded model on a single GPU.
     # Four concurrent 60k-token requests cause VRAM pressure and hollow
@@ -2611,8 +3696,17 @@ def extract_corpus_parallel(
         max_concurrency = 1
     # claude-cli shells out to a Claude Code session; parallel subprocesses conflict
     # over session state. Force serial unless the user explicitly opts in.
-    if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+    if (
+        backend == "claude-cli"
+        and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1"
+    ):
         max_concurrency = 1
+    if (
+        backend == "openai-cli"
+        and os.environ.get("GRAPHIFY_OPENAI_CLI_PARALLEL", "").strip() != "1"
+    ):
+        max_concurrency = 1
+
     def _checkpoint_chunk(result: dict, chunk: "list[Path | FileSlice]") -> None:
         # Persist each chunk's semantic results to the cache as soon as it
         # completes. Without this, the semantic cache is only written once, at
@@ -2624,6 +3718,7 @@ def extract_corpus_parallel(
             return
         try:
             from .cache import save_semantic_cache as _scs
+
             # Scope the write to the files actually dispatched in this chunk
             # (#1757). The model can attribute a node's source_file to another
             # corpus file; without this bound, that stray node would clobber the
@@ -2654,6 +3749,10 @@ def extract_corpus_parallel(
                 # authoritative: pass the partial file set so its entry is
                 # stamped ``partial: True`` and re-dispatched next run.
                 partial_source_files=_partial_source_files(result) or None,
+                execution_profile=execution_profile,
+                run_context=run_context,
+                producer_receipt=result.get("_execution_receipts") or None,
+                attachment_compatibility=attachment_compatibility,
             )
         except Exception as _exc:  # noqa: BLE001 — checkpoint is best-effort
             print(f"[graphify] incremental cache checkpoint failed: {_exc}", file=sys.stderr)
@@ -2667,6 +3766,11 @@ def extract_corpus_parallel(
             if exc is not None:
                 print(f"[graphify] chunk {idx + 1}/{total} failed: {exc}", file=sys.stderr)
                 merged["failed_chunks"] += 1
+                if result is not None:
+                    _merge_into(merged, result)
+                if not isinstance(exc, Exception):
+                    exc.__dict__["graphify_partial_result"] = dict(merged)
+                    raise exc
                 continue
             assert result is not None
             _merge_into(merged, result)
@@ -2692,6 +3796,13 @@ def extract_corpus_parallel(
                         file=sys.stderr,
                     )
                     merged["failed_chunks"] += 1
+                    if result is not None:
+                        results_by_idx[idx] = result
+                    if not isinstance(exc, Exception):
+                        for completed_idx in sorted(results_by_idx):
+                            _merge_into(merged, results_by_idx[completed_idx])
+                        exc.__dict__["graphify_partial_result"] = dict(merged)
+                        raise exc
                     continue
                 assert result is not None
                 results_by_idx[idx] = result
@@ -2763,15 +3874,16 @@ def extract_corpus_parallel(
         # dropped node's id (or itself attributed to an undispatched real
         # file) must not survive its endpoint.
         merged["edges"] = [
-            e for e in merged.get("edges", [])
+            e
+            for e in merged.get("edges", [])
             if not _out_of_scope(e)
             and e.get("source") not in dropped_ids
             and e.get("target") not in dropped_ids
         ]
         merged["hyperedges"] = [
-            h for h in merged.get("hyperedges", [])
-            if not _out_of_scope(h)
-            and not (dropped_ids & set(h.get("nodes", []) or []))
+            h
+            for h in merged.get("hyperedges", [])
+            if not _out_of_scope(h) and not (dropped_ids & set(h.get("nodes", []) or []))
         ]
         shown = ", ".join(sorted(Path(f).name for f in dropped_files)[:5])
         more = f" (+{len(dropped_files) - 5} more)" if len(dropped_files) > 5 else ""
@@ -2789,10 +3901,7 @@ def extract_corpus_parallel(
         if sf:
             p = Path(sf)
             covered.add(p if p.is_absolute() else (root / p))
-    uncovered = sorted(
-        p for p in dispatched
-        if p.resolve() not in {c.resolve() for c in covered}
-    )
+    uncovered = sorted(p for p in dispatched if p.resolve() not in {c.resolve() for c in covered})
     merged["uncovered_files"] = [str(p) for p in uncovered]
     if uncovered:
         shown = ", ".join(p.name for p in uncovered[:5])
@@ -2803,7 +3912,7 @@ def extract_corpus_parallel(
             "returned a response but omitted them; a re-run will retry them.",
             file=sys.stderr,
         )
-    return merged
+    return _attach_raster_evidence(merged, _prepared_raster_request)
 
 
 def _merge_into(merged: dict, result: dict) -> None:
@@ -2813,6 +3922,7 @@ def _merge_into(merged: dict, result: dict) -> None:
     merged["hyperedges"].extend(result.get("hyperedges", []))
     merged["input_tokens"] += result.get("input_tokens", 0)
     merged["output_tokens"] += result.get("output_tokens", 0)
+    merged.setdefault("_execution_receipts", []).extend(result.get("_execution_receipts", []))
     # Carry forward files a chunk truncated to an empty parse (#1950): these have
     # no items to ride the merge, so they'd otherwise be lost from the run-level
     # partial set the manifest stamp consults.
@@ -2829,7 +3939,13 @@ def _call_llm(
     backend: str,
     max_tokens: int = 200,
     model: str | None = None,
+    effort: str | None = None,
     usage_out: dict | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
+    purpose: str = "label",
 ) -> str:
     """Send a plain-text prompt to `backend` and return the model's text reply.
 
@@ -2847,6 +3963,22 @@ def _call_llm(
     exist in this module, so the LLM tiebreaker silently no-op'd on
     `ImportError` (F-038). Adding the function here re-enables it.
     """
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    if execution_profile is not None:
+        resolved_profile = resolve_execution_profile(
+            backend,
+            model,
+            effort,
+            execution_profile=execution_profile,
+            purpose=purpose,
+        )
+        backend = resolved_profile["backend"]
+        model = resolved_profile["model"]
+        effort = resolved_profile["effort"]
+    if effective_managed and backend not in ("claude-cli", "openai-cli"):
+        raise ValueError("capture-required execution requires a registered CLI backend")
     if backend not in BACKENDS:
         raise ValueError(f"Unknown backend {backend!r}")
     cfg = BACKENDS[backend]
@@ -2855,7 +3987,7 @@ def _call_llm(
         ollama_url = _resolve_ollama_base_url(cfg.get("base_url", ""))
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "openai-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
         )
@@ -2882,53 +4014,42 @@ def _call_llm(
             _rec(getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0))
         return _anthropic_response_text(resp.content, default="")
 
-    if backend == "claude-cli":
-        import platform, shutil, subprocess
-        # Mirror the extraction-path resolution: on Windows the npm shim is
-        # claude.cmd, which CreateProcess can't resolve from a bare "claude"
-        # (PATHEXT doesn't apply), so pass the resolved .cmd path explicitly.
-        claude_cmd = "claude"
-        if platform.system() == "Windows":
-            cmd_path = shutil.which("claude.cmd")
-            if cmd_path:
-                claude_cmd = cmd_path
-            elif shutil.which("claude") is None:
-                raise RuntimeError("Claude Code CLI not found on $PATH")
-        elif shutil.which("claude") is None:
-            raise RuntimeError("Claude Code CLI not found on $PATH")
-        cli_args = [claude_cmd, "-p", "--output-format", "json", "--no-session-persistence"]
-        if model is not None:
-            cli_args.extend(["--model", mdl])
-        proc = subprocess.run(
-            cli_args,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",  # Force UTF-8 — prevents UnicodeEncodeError on Windows cp1252
-            errors="replace",  # Tolerate non-UTF-8 bytes (e.g. GBK/cp936 from claude.cmd on Chinese Windows)
-            timeout=_resolve_api_timeout(),
-            check=False,
-            **_no_window_kwargs(),
+    if backend in ("claude-cli", "openai-cli"):
+        selected_model = model
+        selected_effort = effort
+        if execution_profile is None:
+            if backend == "claude-cli":
+                selected_model = (
+                    model or os.environ.get("GRAPHIFY_CLAUDE_CLI_MODEL", "").strip() or None
+                )
+                selected_effort = (
+                    effort or os.environ.get("GRAPHIFY_CLAUDE_CLI_EFFORT", "").strip() or None
+                )
+            else:
+                selected_model = mdl
+                selected_effort = (
+                    effort or os.environ.get("GRAPHIFY_OPENAI_CLI_EFFORT", "").strip() or "ultra"
+                )
+        outcome = _managed_cli_call(
+            prompt,
+            backend=backend,
+            purpose=purpose,
+            max_tokens=max_tokens,
+            deep_mode=False,
+            images=None,
+            model=selected_model,
+            effort=selected_effort,
+            execution_profile=execution_profile,
+            run_context=run_context,
+            process_runner=process_runner,
+            receipt_sink=receipt_sink,
         )
-        cli_error = _claude_cli_error(proc.stdout)
-        if proc.returncode != 0:
-            detail = proc.stderr.strip() or cli_error or "(no stderr, no error envelope)"
-            raise RuntimeError(f"claude -p exited {proc.returncode}: {detail[:500]}")
-        if cli_error:
-            # Without this the error text is returned as the model's reply and
-            # the caller writes it into the graph as a community label (#2554).
-            raise RuntimeError(f"claude -p reported an error: {cli_error[:500]}")
-        envelope = _claude_cli_envelope(proc.stdout)
-        cli_usage = envelope.get("usage") or {}
-        if cli_usage:
-            _rec(
-                (cli_usage.get("input_tokens", 0) or 0)
-                + (cli_usage.get("cache_read_input_tokens", 0) or 0)
-                + (cli_usage.get("cache_creation_input_tokens", 0) or 0),
-                cli_usage.get("output_tokens", 0),
-            )
-        return envelope.get("result", "")
-
+        receipt = outcome["receipt"]
+        usage = receipt.get("usage") or {}
+        _rec(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+        if usage_out is not None and effective_managed:
+            usage_out.setdefault("_execution_receipts", []).append(receipt)
+        return outcome["value"]
 
     if backend == "bedrock":
         try:
@@ -3100,6 +4221,31 @@ def _validate_ollama_base_url(url: str, *, warn: bool = True) -> None:
         )
 
 
+# Everything detect_backend() reads besides the per-backend API keys. Kept next to
+# the function so a new probe below is added here too; tests clear this whole set
+# (tests/conftest.py) so a developer's own keys can never steer them (#3481).
+_BACKEND_DETECTION_EXTRA_ENV = (
+    "AZURE_OPENAI_ENDPOINT",
+    "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
+    "OLLAMA_BASE_URL", "OLLAMA_HOST",
+)
+
+
+def backend_detection_env_vars() -> tuple[str, ...]:
+    """Every environment variable ``detect_backend()`` consults, in probe order.
+
+    Covers the API-key variables of every registered backend (built-in and
+    custom) plus the endpoint/region/host variables checked directly.
+    """
+    seen: dict[str, None] = {}
+    for name in BACKENDS:
+        for env_key in _backend_env_keys(name):
+            seen.setdefault(env_key, None)
+    for env_key in _BACKEND_DETECTION_EXTRA_ENV:
+        seen.setdefault(env_key, None)
+    return tuple(seen)
+
+
 def detect_backend() -> str | None:
     """Return the name of whichever backend has an API key set, or None.
 
@@ -3127,10 +4273,25 @@ def detect_backend() -> str | None:
         _validate_ollama_base_url(ollama_url)
         return "ollama"
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli"):
+        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli", "openai-cli"):
             if _get_backend_api_key(name):
                 return name
     return None
+
+
+def _claude_cli_available() -> bool:
+    """True if the Claude Code CLI can actually be launched.
+
+    Mirrors the resolution in the claude-cli request path: a bare ``claude`` on
+    POSIX, and ``claude.cmd`` on Windows, where CreateProcess cannot resolve the
+    npm shim from the bare name.
+    """
+    import platform
+    import shutil
+
+    if platform.system() == "Windows":
+        return bool(shutil.which("claude.cmd") or shutil.which("claude"))
+    return shutil.which("claude") is not None
 
 
 # ── Community labeling ────────────────────────────────────────────────────────
@@ -3230,6 +4391,11 @@ def _label_batch_with_retry(
     depth: int = 0,
     max_depth: int = 3,
     usage_out: dict | None = None,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
 ) -> dict[int, str]:
     """Label a batch of communities, splitting in half and retrying on parse failure.
 
@@ -3266,6 +4432,15 @@ def _label_batch_with_retry(
     # callers (and their test doubles) see the unchanged _call_llm signature.
     if usage_out is not None:
         call_kwargs["usage_out"] = usage_out
+    for key, value in {
+        "effort": effort,
+        "execution_profile": execution_profile,
+        "run_context": run_context,
+        "process_runner": process_runner,
+        "receipt_sink": receipt_sink,
+    }.items():
+        if value is not None:
+            call_kwargs[key] = value
 
     try:
         text = _call_llm(prompt, **call_kwargs)
@@ -3287,11 +4462,17 @@ def _label_batch_with_retry(
             batch_cids[:mid], batch_lines[:mid],
             backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
             usage_out=usage_out,
+            effort=effort, execution_profile=execution_profile,
+            run_context=run_context, process_runner=process_runner,
+            receipt_sink=receipt_sink,
         )
         right = _label_batch_with_retry(
             batch_cids[mid:], batch_lines[mid:],
             backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
             usage_out=usage_out,
+            effort=effort, execution_profile=execution_profile,
+            run_context=run_context, process_runner=process_runner,
+            receipt_sink=receipt_sink,
         )
         return left | right
 
@@ -3308,6 +4489,11 @@ def label_communities(
     batch_size: int = _LABEL_BATCH_SIZE,
     max_concurrency: int = 4,
     usage_out: dict | None = None,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
 ) -> dict[int, str]:
     """Return a complete ``{cid: name}`` map using ``backend`` for naming.
 
@@ -3328,6 +4514,9 @@ def label_communities(
     written. Callers that want graceful degradation should use
     :func:`generate_community_labels`.
     """
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
     labels = _placeholder_community_labels(communities)
     cap = len(communities) if max_communities is None else max_communities
     lines, labeled_cids = _community_label_lines(G, communities, gods, cap, top_k)
@@ -3345,6 +4534,8 @@ def label_communities(
         max_concurrency = 1
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
+    if backend == "openai-cli" and os.environ.get("GRAPHIFY_OPENAI_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
     workers = max(1, min(max_concurrency, n_batches))
 
     def _run_batch(batch_idx: int):
@@ -3355,9 +4546,21 @@ def label_communities(
         # in _merge (#1694).
         batch_usage: dict = {} if usage_out is not None else None
         batch_kwargs = {"usage_out": batch_usage} if usage_out is not None else {}
+        managed_kwargs = {
+            key: value
+            for key, value in {
+                "effort": effort,
+                "execution_profile": execution_profile,
+                "run_context": run_context,
+                "process_runner": process_runner,
+                "receipt_sink": receipt_sink,
+            }.items()
+            if value is not None
+        }
         try:
             parsed = _label_batch_with_retry(
                 labeled_cids[start:end], lines[start:end], backend=backend, model=model,
+                **managed_kwargs,
                 **batch_kwargs,
             )
             return batch_idx, parsed, None, batch_usage
@@ -3374,7 +4577,19 @@ def label_communities(
         if usage_out is not None and batch_usage:
             usage_out["input"] = usage_out.get("input", 0) + batch_usage.get("input", 0)
             usage_out["output"] = usage_out.get("output", 0) + batch_usage.get("output", 0)
+            batch_receipts = batch_usage.get("_execution_receipts", [])
+            if batch_receipts:
+                usage_out.setdefault("_execution_receipts", []).extend(batch_receipts)
         if exc is not None:
+            if effective_managed and usage_out is not None:
+                attempt = getattr(exc, "graphify_attempt", None)
+                receipt = attempt.get("receipt") if isinstance(attempt, dict) else None
+                if isinstance(receipt, dict):
+                    retained = usage_out.setdefault("_execution_receipts", [])
+                    if not any(
+                        item.get("receipt_id") == receipt.get("receipt_id") for item in retained
+                    ):
+                        retained.append(receipt)
             errors[batch_idx] = exc
             start = batch_idx * batch_size
             end = min(start + batch_size, len(labeled_cids))
@@ -3398,10 +4613,14 @@ def label_communities(
             for future in as_completed(futures):
                 _merge(*future.result())
 
-    if written == 0 and errors:
-        # Every batch failed; propagate the lowest-index error so the message is
-        # deterministic and generate_community_labels degrades cleanly.
-        raise errors[min(errors)]
+    if errors and (effective_managed or written == 0):
+        # Managed labeling cannot promote a partially captured set as an LLM
+        # success. Retain the successful batch outputs on the deterministic
+        # lowest-index error for caller-owned failure evidence.
+        error = errors[min(errors)]
+        if effective_managed:
+            error.__dict__.setdefault("graphify_partial_labels", dict(labels))
+        raise error
     return labels
 
 
@@ -3416,16 +4635,41 @@ def generate_community_labels(
     max_concurrency: int = 4,
     batch_size: int = _LABEL_BATCH_SIZE,
     usage_out: dict | None = None,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner: Callable | None = None,
+    receipt_sink: Callable | None = None,
 ) -> tuple[dict[int, str], str]:
     """CLI entry point: resolve a backend, name communities, and degrade to
     ``Community N`` placeholders on any failure (no backend, API error, malformed
     reply). Returns ``(labels, source)`` where source is ``"llm"`` or
     ``"placeholder"``. Never raises."""
-    if backend is None:
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    if execution_profile is not None:
+        resolved = resolve_execution_profile(
+            backend, model, effort, execution_profile=execution_profile, purpose="label"
+        )
+        backend, model, effort = resolved["backend"], resolved["model"], resolved["effort"]
+    elif effective_managed:
+        if backend not in ("claude-cli", "openai-cli"):
+            raise ValueError("capture-required execution requires a registered CLI backend")
+    elif backend is None:
         try:
             backend = detect_backend()
         except Exception:
             backend = None
+    if not effective_managed and not backend and _claude_cli_available():
+        # `detect_backend` is key-based, and claude-cli is the one backend with no
+        # key to find, so it can never be detected there — and widening detection
+        # itself would change extraction's contract, which deliberately refuses to
+        # run without a configured backend. Here the alternative is not an error but
+        # a SILENT DOWNGRADE: replacing every real community name with
+        # "Community N" and exiting 0, which overwrites a good graph with a worse
+        # one while reporting success. An installed CLI is better than that.
+        backend = "claude-cli"
     if not backend:
         if not quiet:
             print(
@@ -3439,9 +4683,14 @@ def generate_community_labels(
             G, communities, backend=backend, model=model, gods=gods,
             max_concurrency=max_concurrency, batch_size=batch_size,
             usage_out=usage_out,
+            effort=effort, execution_profile=execution_profile,
+            run_context=run_context, process_runner=process_runner,
+            receipt_sink=receipt_sink,
         )
         return labels, "llm"
     except Exception as exc:
+        if effective_managed:
+            raise
         if not quiet:
             print(
                 f"[graphify label] warning: community labeling failed ({exc}); "

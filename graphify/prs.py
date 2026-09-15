@@ -142,6 +142,7 @@ def _gh(*args: str) -> list | dict | None:
     try:
         result = subprocess.run(
             ["gh", *args],
+            stdin=subprocess.DEVNULL,
             # Decode gh's output as UTF-8, not the Windows cp1252 locale codec: gh
             # emits UTF-8 JSON with non-Latin1 titles/logins (emoji, فارسی), and the
             # default text=True decode crashes on those (#1505 fixed the same in llm).
@@ -157,24 +158,27 @@ def _gh(*args: str) -> list | dict | None:
 def _detect_default_branch(repo: str | None = None) -> str:
     """Auto-detect the repo's default branch via gh, then git, then fall back to 'main'."""
     # Try gh first — works for any repo, not just the current directory
-    args = ["repo", "view", "--json", "defaultBranchRef"]
+    args = ["repo", "view"]
     if repo:
-        args += ["--repo", repo]
+        args.append(repo)
+    args += ["--json", "defaultBranchRef"]
     data = _gh(*args)
     if data and data.get("defaultBranchRef", {}).get("name"):
         return data["defaultBranchRef"]["name"]
-    # Fall back to git symbolic-ref for the current repo
-    try:
-        result = subprocess.run(
-            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5
-        )
-        if result.returncode == 0:
-            # refs/remotes/origin/main → main
-            ref = result.stdout.strip()
-            return ref.split("/")[-1] if ref else "main"
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    # Fall back to git symbolic-ref for the current repo (only when repo is not specified)
+    if not repo:
+        try:
+            result = subprocess.run(
+                ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5
+            )
+            if result.returncode == 0:
+                # refs/remotes/origin/main → main
+                ref = result.stdout.strip()
+                return ref.split("/")[-1] if ref else "main"
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
     return "main"
 
 
@@ -232,7 +236,11 @@ def fetch_pr_files(number: int, repo: str | None = None) -> list[str]:
     if repo:
         args += ["--repo", repo]
     try:
-        result = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        result = subprocess.run(
+            ["gh", *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30
+        )
         if result.returncode != 0:
             return []
         return [l.strip() for l in result.stdout.splitlines() if l.strip()]
@@ -303,6 +311,7 @@ def fetch_worktrees() -> dict[str, str]:
     try:
         result = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
+            stdin=subprocess.DEVNULL,
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10
         )
         if result.returncode != 0:
@@ -584,7 +593,23 @@ def _resolve_triage_backend() -> tuple[str, str]:
     return "ollama", _default_model_for_backend("ollama")
 
 
-def triage_with_opus(prs: list[PRInfo], base: str) -> None:
+def triage_with_opus(
+    prs: list[PRInfo],
+    base: str,
+    *,
+    backend: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner=None,
+    receipt_sink=None,
+) -> None:
+    from graphify.execution import validate_effective_managed_mode
+
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
     try:
         from graphify.llm import BACKENDS, _get_backend_api_key
     except ImportError:
@@ -612,11 +637,24 @@ def triage_with_opus(prs: list[PRInfo], base: str) -> None:
         + "\n\n".join(lines)
     )
 
-    try:
-        backend, model = _resolve_triage_backend()
-    except Exception as e:
-        print(red(f"  Could not resolve triage backend: {e}"), file=sys.stderr)
-        sys.exit(1)
+    if execution_profile is not None:
+        from graphify.execution import resolve_execution_profile
+        resolved = resolve_execution_profile(
+            backend, model, effort, execution_profile=execution_profile, purpose="triage"
+        )
+        backend, model, effort = resolved["backend"], resolved["model"], resolved["effort"]
+    elif effective_managed:
+        if backend not in ("claude-cli", "openai-cli"):
+            raise ValueError("capture-required execution requires a registered CLI backend")
+    elif backend is None:
+        try:
+            backend, model = _resolve_triage_backend()
+        except Exception as e:
+            print(red(f"  Could not resolve triage backend: {e}"), file=sys.stderr)
+            sys.exit(1)
+    elif model is None:
+        from graphify.llm import _default_model_for_backend
+        model = _TRIAGE_MODEL_DEFAULTS.get(backend) or _default_model_for_backend(backend)
 
     print()
     print(bold("  Triage") + dim(f" ({backend} / {model})"))
@@ -651,28 +689,21 @@ def triage_with_opus(prs: list[PRInfo], base: str) -> None:
                         print(delta.replace("\n", "\n  "), end="", flush=True)
             print("\n")
 
-        elif backend == "claude-cli":
-            import platform as _platform, shutil as _shutil, subprocess as _sp
-            _claude = "claude"
-            if _platform.system() == "Windows":
-                _claude = _shutil.which("claude.cmd") or _shutil.which("claude") or "claude"
-            proc = _sp.run(
-                [_claude, "-p", "--no-session-persistence"],
-                input=prompt, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=120,
+        elif backend in ("claude-cli", "openai-cli"):
+            from graphify.llm import _call_llm
+            result = _call_llm(
+                prompt, backend=backend, max_tokens=1024, model=model, effort=effort,
+                execution_profile=execution_profile, run_context=run_context,
+                process_runner=process_runner, receipt_sink=receipt_sink,
+                purpose="triage",
             )
-            if proc.returncode != 0:
-                print(red(f"  claude -p failed: {proc.stderr.strip()[:300]}"), file=sys.stderr)
-            else:
-                try:
-                    result = json.loads(proc.stdout).get("result") or proc.stdout
-                except json.JSONDecodeError:
-                    result = proc.stdout
-                for line in result.splitlines():
-                    print(f"  {line}")
-                print()
+            for line in result.splitlines():
+                print(f"  {line}")
+            print()
 
     except Exception as e:
+        if effective_managed:
+            raise
         print(f"\n\n  {red(f'Triage failed: {e}')}", file=sys.stderr)
 
 
@@ -685,6 +716,9 @@ def cmd_prs(argv: list[str]) -> None:
     do_worktrees = False
     do_conflicts = False
     show_wrong_base = False
+    triage_backend: str | None = None
+    triage_model: str | None = None
+    triage_effort: str | None = None
     pr_number: int | None = None
     graph_path = Path(_default_graph_json())
 
@@ -699,6 +733,18 @@ def cmd_prs(argv: list[str]) -> None:
             do_conflicts = True
         elif arg == "--wrong-base":
             show_wrong_base = True
+        elif arg == "--backend" and i + 1 < len(argv):
+            triage_backend = argv[i + 1]; i += 1
+        elif arg.startswith("--backend="):
+            triage_backend = arg.split("=", 1)[1]
+        elif arg == "--model" and i + 1 < len(argv):
+            triage_model = argv[i + 1]; i += 1
+        elif arg.startswith("--model="):
+            triage_model = arg.split("=", 1)[1]
+        elif arg == "--effort" and i + 1 < len(argv):
+            triage_effort = argv[i + 1]; i += 1
+        elif arg.startswith("--effort="):
+            triage_effort = arg.split("=", 1)[1]
         elif arg in ("--base", "-b") and i + 1 < len(argv):
             base = argv[i + 1]; i += 1
         elif arg.startswith("--base="):
@@ -718,6 +764,10 @@ def cmd_prs(argv: list[str]) -> None:
 
     if base is None:
         base = _detect_default_branch(repo)
+
+    if (triage_backend or triage_model or triage_effort) and not do_triage:
+        print("error: --backend/--model/--effort require --triage", file=sys.stderr)
+        sys.exit(2)
 
     try:
         prs = fetch_prs(repo=repo, base=base)
@@ -746,7 +796,9 @@ def cmd_prs(argv: list[str]) -> None:
 
     if do_triage:
         render_dashboard(prs, base, show_wrong_base)
-        triage_with_opus(prs, base)
+        triage_with_opus(
+            prs, base, backend=triage_backend, model=triage_model, effort=triage_effort
+        )
         return
 
     if do_worktrees:
