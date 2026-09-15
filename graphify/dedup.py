@@ -553,6 +553,12 @@ def deduplicate_entities(
     *,
     communities: dict[str, int],
     dedup_llm_backend: str | None = None,
+    dedup_llm_model: str | None = None,
+    dedup_llm_effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner=None,
+    receipt_sink=None,
     root: str | Path | None = None,
     hyperedges: "list[dict] | None" = None,
     protected_ids: "set[str] | None" = None,
@@ -920,10 +926,32 @@ def deduplicate_entities(
                     fuzzy_merges += 1
 
     # ── pass 3: LLM tiebreaker for ambiguous pairs (opt-in) ──────────────────
+    from graphify.execution import resolve_execution_profile, validate_effective_managed_mode
+
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    if execution_profile is not None:
+
+        resolved = resolve_execution_profile(
+            dedup_llm_backend,
+            dedup_llm_model,
+            dedup_llm_effort,
+            execution_profile=execution_profile,
+            purpose="dedup",
+        )
+        dedup_llm_backend = resolved["backend"]
+        dedup_llm_model = resolved["model"]
+        dedup_llm_effort = resolved["effort"]
+    elif effective_managed and dedup_llm_backend not in (None, "claude-cli", "openai-cli"):
+        raise ValueError("capture-required execution requires a registered CLI backend")
     if dedup_llm_backend is not None:
         _llm_tiebreak(
             candidates, uf, communities, backend=dedup_llm_backend,
             protected_set=protected_set, get_prot=_get_prot, union_with_prot=_union_with_prot,
+            model=dedup_llm_model, effort=dedup_llm_effort,
+            execution_profile=execution_profile, run_context=run_context,
+            process_runner=process_runner, receipt_sink=receipt_sink,
         )
 
     # ── build remap table from union-find components ──────────────────────────
@@ -1092,14 +1120,27 @@ def _llm_tiebreak(
     protected_set: set[str] | None = None,
     get_prot=None,
     union_with_prot=None,
+    model: str | None = None,
+    effort: str | None = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner=None,
+    receipt_sink=None,
 ) -> None:
     """Batch-resolve ambiguous pairs (score in [low, high)) via LLM."""
+    from graphify.execution import validate_effective_managed_mode
+
+    _validated_context, effective_managed = validate_effective_managed_mode(
+        execution_profile, run_context
+    )
+    if effective_managed and backend not in ("claude-cli", "openai-cli"):
+        raise ValueError("capture-required execution requires a registered CLI backend")
     try:
         from graphify.llm import BACKENDS, _format_backend_env_keys, _get_backend_api_key
         if backend not in BACKENDS:
             print(f"[graphify] --dedup-llm: unknown backend {backend!r}, skipping LLM tiebreaker.", flush=True)
             return
-        if not _get_backend_api_key(backend):
+        if not _get_backend_api_key(backend) and backend not in ("claude-cli", "openai-cli"):
             env_keys = _format_backend_env_keys(backend)
             print(f"[graphify] --dedup-llm: {env_keys} not set, skipping LLM tiebreaker.", flush=True)
             return
@@ -1175,7 +1216,18 @@ def _llm_tiebreak(
             "Reply with one line per pair: '1. yes', '2. no', etc."
         )
         try:
-            response = _call_llm(prompt, backend=backend, max_tokens=200)
+            call_kwargs = {"backend": backend, "max_tokens": 200, "purpose": "dedup"}
+            for key, value in {
+                "model": model,
+                "effort": effort,
+                "execution_profile": execution_profile,
+                "run_context": run_context,
+                "process_runner": process_runner,
+                "receipt_sink": receipt_sink,
+            }.items():
+                if value is not None:
+                    call_kwargs[key] = value
+            response = _call_llm(prompt, **call_kwargs)
             lines = response.strip().splitlines()
             for line in lines:
                 line = line.strip()
@@ -1210,4 +1262,6 @@ def _llm_tiebreak(
                             uf.union(winner["id"], a["id"])
                             uf.union(winner["id"], b["id"])
         except Exception as exc:
+            if effective_managed:
+                raise
             print(f"[graphify] --dedup-llm batch failed: {exc}", flush=True)

@@ -2,6 +2,11 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased
+
+- Feature: `graphify export neo4j|falkordb --push` now sends nodes and edges in UNWIND batches (`--batch-size`, default 100) instead of one query per entry, so a remote push stops spending nearly all its time on round trips (~100x fewer for the default); rows are grouped by sanitized node label / relationship type first (those are baked into the Cypher text and cannot be parameters), the row payloads are exactly the old per-entry params, and UNWIND processes rows in order, so the MERGE/SET upsert semantics — including idempotent re-runs — are unchanged.
+- Fix: `openai-cli`'s per-call MCP-disable optimisation no longer disables a server name Codex cannot actually resolve for the current working directory (a plugin-provided server, or one configured only for another repo) — such a name previously produced an override with neither `command` nor `url`, which made Codex reject its entire bootstrap configuration and fail the whole extraction call. Each name is now confirmed resolvable (one combined probe, falling back to one probe per name only if that fails) before its override is emitted; an unresolvable name is now silently left enabled instead of taking the run down, and every resolvable name alongside it is still disabled. The resolvability check is memoized in-process per (Codex binary, working directory[, server list]), so only the first `codex exec` in a run pays for the listing and the fallback probes (measured: ~15s across 12 subprocess spawns with 10 configured servers, 6 of them plugin-provided) — every later call in the same run and directory returns instantly.
+
 ## 0.9.61 (unreleased)
 
 - Fix: `graphify.serve` now imports cleanly on Python 3.12 and 3.13. The `chinese` extra pins `jieba-py` from 3.12 onward (0.9.60 mistakenly kept the old `jieba` until 3.14, and its invalid regex escapes are a hard error on 3.12+), and the jieba import now suppresses the tokenizer's `SyntaxWarning` regardless of message or line so it never escalates under `-W error`.

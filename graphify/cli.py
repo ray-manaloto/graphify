@@ -1980,14 +1980,69 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
 
     elif cmd == "watch":
-        watch_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".")
+        watch_semantic = False
+        watch_backend: str | None = None
+        watch_fallback_backend: str | None = None
+        watch_model: str | None = None
+        watch_effort: str | None = None
+        watch_arg: str | None = None
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--semantic":
+                watch_semantic = True; i += 1
+            elif a == "--backend" and i + 1 < len(args):
+                watch_backend = args[i + 1]; i += 2
+            elif a.startswith("--backend="):
+                watch_backend = a.split("=", 1)[1]; i += 1
+            elif a == "--fallback-backend" and i + 1 < len(args):
+                watch_fallback_backend = args[i + 1]; i += 2
+            elif a.startswith("--fallback-backend="):
+                watch_fallback_backend = a.split("=", 1)[1]; i += 1
+            elif a == "--model" and i + 1 < len(args):
+                watch_model = args[i + 1]; i += 2
+            elif a.startswith("--model="):
+                watch_model = a.split("=", 1)[1]; i += 1
+            elif a == "--effort" and i + 1 < len(args):
+                watch_effort = args[i + 1]; i += 2
+            elif a.startswith("--effort="):
+                watch_effort = a.split("=", 1)[1]; i += 1
+            elif a.startswith("-"):
+                print(f"error: unknown watch option: {a}", file=sys.stderr)
+                sys.exit(2)
+            else:
+                if watch_arg is not None:
+                    print("error: watch accepts at most one path argument", file=sys.stderr)
+                    sys.exit(2)
+                watch_arg = a; i += 1
+
+        if (watch_backend or watch_fallback_backend or watch_model or watch_effort) and not watch_semantic:
+            # Without --semantic the watcher never runs an extract, so a
+            # backend flag would be a silent no-op the user believes took
+            # effect — reject it loudly instead.
+            print(
+                "error: --backend/--fallback-backend/--model/--effort require --semantic "
+                "(they configure the automatic semantic extraction pass)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        watch_path = Path(watch_arg) if watch_arg is not None else Path(".")
         if not watch_path.exists():
             print(f"error: path not found: {watch_path}", file=sys.stderr)
             sys.exit(1)
         from graphify.watch import watch as _watch
 
         try:
-            _watch(watch_path)
+            _watch(
+                watch_path,
+                semantic=watch_semantic,
+                backend=watch_backend,
+                fallback_backend=watch_fallback_backend,
+                model=watch_model,
+                effort=watch_effort,
+            )
         except ImportError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -2006,6 +2061,8 @@ def dispatch_command(cmd: str) -> None:
         label_backend = _backend_arg.split("=", 1)[1] if _backend_arg else None
         _model_arg = next((a for a in sys.argv if a.startswith("--model=")), None)
         label_model = _model_arg.split("=", 1)[1] if _model_arg else None
+        _effort_arg = next((a for a in sys.argv if a.startswith("--effort=")), None)
+        label_effort = _effort_arg.split("=", 1)[1] if _effort_arg else None
         _min_cs_arg = next((a for a in sys.argv if a.startswith("--min-community-size=")), None)
         min_community_size = int(_min_cs_arg.split("=")[1]) if _min_cs_arg else 3
         args = sys.argv[2:]
@@ -2034,6 +2091,10 @@ def dispatch_command(cmd: str) -> None:
                 label_model = args[i_arg + 1]; i_arg += 2
             elif a.startswith("--model="):
                 label_model = a.split("=", 1)[1]; i_arg += 1
+            elif a == "--effort" and i_arg + 1 < len(args):
+                label_effort = args[i_arg + 1]; i_arg += 2
+            elif a.startswith("--effort="):
+                label_effort = a.split("=", 1)[1]; i_arg += 1
             elif a == "--resolution" and i_arg + 1 < len(args):
                 co_resolution = float(args[i_arg + 1]); i_arg += 2
             elif a.startswith("--resolution="):
@@ -2160,6 +2221,7 @@ def dispatch_command(cmd: str) -> None:
             _ignored_label_flags = [flag for flag, given in (
                 ("--backend", label_backend is not None),
                 ("--model", label_model is not None),
+                ("--effort", label_effort is not None),
                 ("--batch-size", label_batch_size_explicit),
                 ("--max-concurrency", label_max_concurrency_explicit),
             ) if given]
@@ -2257,10 +2319,15 @@ def dispatch_command(cmd: str) -> None:
                     for cid, members in communities.items()
                     if cid not in existing_labels or existing_labels.get(cid) == f"Community {cid}"
                 }
+            _label_kwargs = {
+                "backend": label_backend, "model": label_model, "gods": gods,
+                "max_concurrency": label_max_concurrency,
+                "batch_size": label_batch_size, "usage_out": label_token_usage,
+            }
+            if label_effort is not None:
+                _label_kwargs["effort"] = label_effort
             generated_labels, _ = generate_community_labels(
-                G, label_communities_input, backend=label_backend, model=label_model, gods=gods,
-                max_concurrency=label_max_concurrency, batch_size=label_batch_size,
-                usage_out=label_token_usage,
+                G, label_communities_input, **_label_kwargs,
             )
             # Only let the LLM OVERRIDE where it produced a real name — its no-backend
             # fallback returns "Community {cid}" placeholders, which must not clobber
@@ -2790,9 +2857,9 @@ def dispatch_command(cmd: str) -> None:
             print("  wiki      [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  svg       [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  graphml   [--graph PATH]", file=sys.stderr)
-            print("  neo4j     [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
+            print("  neo4j     [--graph PATH] [--push URI] [--user U] [--password P] [--batch-size N]", file=sys.stderr)
             print("            (or set NEO4J_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
-            print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
+            print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P] [--batch-size N]", file=sys.stderr)
             print("            (or set FALKORDB_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
             sys.exit(1)
 
@@ -2827,6 +2894,9 @@ def dispatch_command(cmd: str) -> None:
             os.environ.get("FALKORDB_PASSWORD") if subcmd == "falkordb"
             else os.environ.get("NEO4J_PASSWORD")
         ) or None
+        # UNWIND rows per round trip for the push sinks; the per-entry queries
+        # made a remote push spend nearly all its time on round trips.
+        push_batch_size = 100
         i = 0
         while i < len(args):
             a = args[i]
@@ -2882,6 +2952,16 @@ def dispatch_command(cmd: str) -> None:
                 push_user = args[i + 1]; i += 2
             elif a == "--password" and i + 1 < len(args):
                 push_password = args[i + 1]; i += 2
+            elif a == "--batch-size" and i + 1 < len(args):
+                try:
+                    push_batch_size = int(args[i + 1])
+                except ValueError:
+                    print("error: --batch-size must be an integer", file=sys.stderr)
+                    sys.exit(2)
+                if push_batch_size < 1:
+                    print("error: --batch-size must be a positive integer", file=sys.stderr)
+                    sys.exit(2)
+                i += 2
             elif subcmd == "callflow-html" and not a.startswith("-") and not graph_path_explicit:
                 candidate = Path(a)
                 if candidate.name == "graph.json" or candidate.suffix.lower() == ".json":
@@ -3067,7 +3147,8 @@ def dispatch_command(cmd: str) -> None:
                     print("error: --password required for --push", file=sys.stderr)
                     sys.exit(1)
                 result = _push(G, uri=push_uri, user=push_user,
-                               password=push_password, communities=communities)
+                               password=push_password, communities=communities,
+                               batch_size=push_batch_size)
                 print(f"Pushed to Neo4j: {result['nodes']} nodes, {result['edges']} edges")
             else:
                 from graphify.export import to_cypher as _to_cypher
@@ -3078,7 +3159,8 @@ def dispatch_command(cmd: str) -> None:
             if push_uri:
                 from graphify.export import push_to_falkordb as _push
                 result = _push(G, uri=push_uri, user=push_user,
-                               password=push_password, communities=communities)
+                               password=push_password, communities=communities,
+                               batch_size=push_batch_size)
                 print(f"Pushed to FalkorDB: {result['nodes']} nodes, {result['edges']} edges")
             else:
                 from graphify.export import to_cypher as _to_cypher
@@ -3181,7 +3263,8 @@ def dispatch_command(cmd: str) -> None:
         if len(sys.argv) < 3:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
-                "[--model M] [--mode deep] [--out DIR|--output DIR] [--google-workspace] [--no-cluster] "
+                "[--fallback-backend B] "
+                "[--model M] [--effort E] [--mode deep] [--out DIR|--output DIR] [--google-workspace] [--no-cluster] "
                 "[--no-gitignore] [--code-only] [--no-dedup] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S] [--postgres DSN] [--cargo] [--allow-partial] [--timing]",
@@ -3201,6 +3284,7 @@ def dispatch_command(cmd: str) -> None:
 
         backend: str | None = None
         model: str | None = None
+        effort: str | None = None
         extract_mode: str | None = None
         out_dir: Path | None = None
         cli_postgres_dsn: str | None = None
@@ -3233,6 +3317,12 @@ def dispatch_command(cmd: str) -> None:
         # --force parity with `graphify update`: the flag or GRAPHIFY_FORCE=1
         # disables the incremental gate and skips semantic-cache reads (#1894).
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
+        # --fallback-backend: a second backend to retry the semantic pass on
+        # when EVERY chunk fails on the primary (missing SDK, bad key, an
+        # outage). The CLI flag wins over GRAPHIFY_FALLBACK_BACKEND.
+        fallback_backend: str | None = (
+            os.environ.get("GRAPHIFY_FALLBACK_BACKEND", "").strip() or None
+        )
 
         def _parse_int(name: str, raw: str) -> int:
             try:
@@ -3264,10 +3354,18 @@ def dispatch_command(cmd: str) -> None:
                 backend = args[i + 1]; i += 2
             elif a.startswith("--backend="):
                 backend = a.split("=", 1)[1]; i += 1
+            elif a == "--fallback-backend" and i + 1 < len(args):
+                fallback_backend = args[i + 1]; i += 2
+            elif a.startswith("--fallback-backend="):
+                fallback_backend = a.split("=", 1)[1]; i += 1
             elif a == "--model" and i + 1 < len(args):
                 model = args[i + 1]; i += 2
             elif a.startswith("--model="):
                 model = a.split("=", 1)[1]; i += 1
+            elif a == "--effort" and i + 1 < len(args):
+                effort = args[i + 1]; i += 2
+            elif a.startswith("--effort="):
+                effort = a.split("=", 1)[1]; i += 1
             elif a == "--mode" and i + 1 < len(args):
                 extract_mode = args[i + 1]; i += 2
             elif a.startswith("--mode="):
@@ -3659,6 +3757,17 @@ def dispatch_command(cmd: str) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        # Validate the fallback's NAME upfront so a typo fails before any API
+        # spend; its key/credential check is deferred to fire time — if the
+        # retry then fails too, the total-failure error below already tells
+        # the user what to install or set.
+        if fallback_backend is not None and fallback_backend not in _BACKENDS:
+            print(
+                f"error: unknown fallback backend '{fallback_backend}'. "
+                f"Available: {', '.join(sorted(_BACKENDS))}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if needs_llm:
             if backend is None:
                 reasons = []
@@ -3719,6 +3828,17 @@ def dispatch_command(cmd: str) -> None:
                         print(
                             "error: backend 'claude-cli' requires the `claude` CLI on $PATH "
                             "(install Claude Code and run `claude` once to authenticate).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                elif backend == "openai-cli":
+                    import shutil as _shutil
+                    allow_no_key = _shutil.which("codex") is not None
+                    if not allow_no_key:
+                        print(
+                            "error: backend 'openai-cli' requires the `codex` CLI on $PATH "
+                            "(npm install -g @openai/codex, then run `codex` once to "
+                            "authenticate with your ChatGPT account).",
                             file=sys.stderr,
                         )
                         sys.exit(1)
@@ -3879,6 +3999,11 @@ def dispatch_command(cmd: str) -> None:
         # the same prompt, or the write lands where the next read won't look.
         from graphify.llm import _extraction_system as _sem_prompt_for
         sem_prompt = _sem_prompt_for(deep=deep_mode)
+        from graphify.llm import _preflight_raster_cache_admission
+        _raster_admission = _preflight_raster_cache_admission(
+            [Path(path) for path in semantic_files], root=target
+        )
+        _attachment_compatibility = _raster_admission["attachment_compatibility"]
         if semantic_files:
             sem_paths_str = [str(p) for p in semantic_files]
             if force:
@@ -3890,7 +4015,8 @@ def dispatch_command(cmd: str) -> None:
             else:
                 cached_nodes, cached_edges, cached_hyperedges, uncached_paths = (
                     _check_semantic_cache(sem_paths_str, root=target, cache_root=out_root,
-                                          mode=sem_cache_mode, prompt=sem_prompt)
+                                          mode=sem_cache_mode, prompt=sem_prompt,
+                                          attachment_compatibility=_attachment_compatibility)
                 )
             sem_cache_hits = len(semantic_files) - len(uncached_paths)
             sem_cache_misses = len(uncached_paths)
@@ -3901,65 +4027,205 @@ def dispatch_command(cmd: str) -> None:
                 print(f"[graphify extract] semantic cache: {sem_cache_hits} hit / {sem_cache_misses} miss")
 
             if uncached_paths:
-                print(f"[graphify extract] semantic extraction on {len(uncached_paths)} files via {backend}...")
-                corpus_kwargs: dict = {
-                    "backend": backend,
-                    "model": model,
-                    "root": target,
-                    "cache_root": out_root,
-                }
-                if deep_mode:
-                    corpus_kwargs["deep_mode"] = True
-                if cli_token_budget is not None:
-                    corpus_kwargs["token_budget"] = cli_token_budget
-                if cli_max_concurrency is not None:
-                    corpus_kwargs["max_concurrency"] = cli_max_concurrency
+                def _dispatch_semantic(
+                    be: str, paths: list[str], *, last_resort: bool = True
+                ) -> tuple[dict, dict]:
+                    """Run one semantic-extraction pass over ``paths`` via ``be``.
 
-                # Minimal progress callback so the CLI is no longer silent
-                # during long local-inference runs (issue #792 addendum).
-                # Also track per-chunk success so we can fail loudly when
-                # every chunk errors (e.g. missing backend SDK package).
-                _chunk_stats = {"total": 0, "succeeded": 0}
-                def _progress(idx: int, total: int, _result: dict) -> None:
-                    _chunk_stats["total"] = total
-                    _chunk_stats["succeeded"] += 1
-                    print(
-                        f"[graphify extract] chunk {idx + 1}/{total} done",
-                        flush=True,
-                    )
-                corpus_kwargs["on_chunk_done"] = _progress
+                    Returns ``(fresh, chunk_stats)``. ``chunk_stats`` counts
+                    per-chunk successes via the progress callback (issue #792
+                    addendum: it also keeps the CLI from being silent during
+                    long local-inference runs) and records ``crashed`` when the
+                    whole pass raised. A crashed pass returns an empty
+                    accumulator instead of propagating, so the caller can retry
+                    the same paths on --fallback-backend before failing the
+                    build. ``last_resort=False`` softens a missing-SDK
+                    ImportError from fatal to a failed pass — with a fallback
+                    configured, a missing package on the primary is exactly the
+                    case the fallback exists for.
+                    """
+                    print(f"[graphify extract] semantic extraction on {len(paths)} files via {be}...")
+                    corpus_kwargs: dict = {
+                        "backend": be,
+                        # --model names a model on the PRIMARY backend; on the
+                        # fallback it would be an unknown name there, so the
+                        # fallback runs on its own default model.
+                        "model": model if be == backend else None,
+                        "effort": effort if be == backend else None,
+                        "root": target,
+                        "cache_root": out_root,
+                        "attachment_compatibility": _attachment_compatibility,
+                    }
+                    if _prepared_raster_request is not None:
+                        corpus_kwargs["_prepared_raster_request"] = _prepared_raster_request
+                    if deep_mode:
+                        corpus_kwargs["deep_mode"] = True
+                    if cli_token_budget is not None:
+                        corpus_kwargs["token_budget"] = cli_token_budget
+                    if cli_max_concurrency is not None:
+                        corpus_kwargs["max_concurrency"] = cli_max_concurrency
 
-                try:
-                    fresh = _extract_corpus_parallel(
-                        [Path(p) for p in uncached_paths],
-                        **corpus_kwargs,
+                    chunk_stats = {
+                        "total": 0, "succeeded": 0, "crashed": False,
+                        "local_prelaunch_failure": False,
+                    }
+                    def _progress(idx: int, total: int, _result: dict) -> None:
+                        chunk_stats["total"] = total
+                        chunk_stats["succeeded"] += 1
+                        print(
+                            f"[graphify extract] chunk {idx + 1}/{total} done",
+                            flush=True,
+                        )
+                    corpus_kwargs["on_chunk_done"] = _progress
+
+                    _empty = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+                    try:
+                        fresh = _extract_corpus_parallel(
+                            [Path(p) for p in paths],
+                            **corpus_kwargs,
+                        )
+                    except ImportError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        if last_resort:
+                            sys.exit(1)
+                        fresh = {
+                            **_empty,
+                            "_local_failures": [{
+                                "type": type(exc).__name__, "message": str(exc),
+                                "classification": "failed_before_launch",
+                            }],
+                        }
+                        chunk_stats["crashed"] = True
+                        chunk_stats["local_prelaunch_failure"] = True
+                    except Exception as exc:
+                        print(
+                            f"[graphify extract] semantic extraction failed: {exc}",
+                            file=sys.stderr,
+                        )
+                        fresh = dict(_empty)
+                        attempt = getattr(exc, "graphify_attempt", None)
+                        receipt = attempt.get("receipt") if isinstance(attempt, dict) else None
+                        if isinstance(receipt, dict):
+                            fresh["_execution_receipts"] = [receipt]
+                        chunk_stats["crashed"] = True  # the semantic pass crashed
+                    return fresh, chunk_stats
+
+                _fallback_eligible = (
+                    fallback_backend is not None and fallback_backend != backend
+                )
+                from graphify.llm import _prepare_cli_raster_attachments
+
+                _stage_backend = (
+                    "openai-cli"
+                    if "openai-cli" in {backend, fallback_backend}
+                    else backend
+                )
+                with _prepare_cli_raster_attachments(
+                    [[Path(path) for path in uncached_paths]],
+                    backend=_stage_backend,
+                    root=target,
+                    execution_profile=None,
+                    run_context=None,
+                    attachment_stager=None,
+                    attachment_snapshot_root=None,
+                ) as _prepared_raster_request:
+                    if (
+                        _prepared_raster_request["attachment_compatibility"]
+                        != _attachment_compatibility
+                    ):
+                        print(
+                            "error: raster attachment compatibility changed after cache admission",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                    fresh, _chunk_stats = _dispatch_semantic(
+                        backend, uncached_paths, last_resort=not _fallback_eligible
                     )
-                except ImportError as exc:
-                    print(f"error: {exc}", file=sys.stderr)
-                    sys.exit(1)
-                except Exception as exc:
-                    print(
-                        f"[graphify extract] semantic extraction failed: {exc}",
-                        file=sys.stderr,
+                    _last_backend = backend
+                    from graphify.execution import paid_work_state as _paid_work_state
+                    _primary_work_state = _paid_work_state(
+                        fresh.get("_execution_receipts", []),
+                        [{"cache_hits": sem_cache_hits}] if sem_cache_hits else [],
                     )
-                    fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
-                    _extraction_incomplete = True  # the semantic pass crashed
+                    if any(fresh.get(key) for key in ("nodes", "edges", "hyperedges")):
+                        _primary_work_state = "usable"
+                    elif (
+                        _chunk_stats["succeeded"] == 0
+                        and not fresh.get("_execution_receipts")
+                        and not _chunk_stats.get("local_prelaunch_failure")
+                    ):
+                        _primary_work_state = "uncertain"
+                    if (
+                        _fallback_eligible
+                        and _chunk_stats["succeeded"] == 0
+                        and _primary_work_state == "none"
+                    ):
+                        from graphify.llm import _preflight_raster_cache_admission
+
+                        _fallback_admission = _preflight_raster_cache_admission(
+                            [Path(path) for path in uncached_paths], root=target
+                        )
+                        if (
+                            _fallback_admission["attachment_compatibility"]
+                            != _attachment_compatibility
+                        ):
+                            print(
+                                "error: raster attachment compatibility changed before fallback",
+                                file=sys.stderr,
+                            )
+                            sys.exit(1)
+                        # Nothing was cache-saved for a zero-success pass (the save
+                        # runs below), so the fallback retries exactly the same
+                        # still-uncached files, once, under the original stage lease.
+                        print(
+                            f"[graphify extract] all semantic chunks failed for backend "
+                            f"'{backend}'; retrying once with fallback backend "
+                            f"'{fallback_backend}'..."
+                        )
+                        fresh, _chunk_stats = _dispatch_semantic(
+                            fallback_backend, uncached_paths
+                        )
+                        _last_backend = fallback_backend
+                    elif _fallback_eligible and _chunk_stats["succeeded"] == 0:
+                        print(
+                            "[graphify extract] fallback blocked: the primary run produced "
+                            f"{_primary_work_state} paid work or compatible cached work; "
+                            "preserving its evidence without cross-backend re-dispatch.",
+                            file=sys.stderr,
+                        )
 
                 # on_chunk_done only fires after a chunk succeeds. If fresh
-                # semantic extraction was requested and no chunks completed,
-                # fail instead of writing an AST-only graph with exit 0.
-                if uncached_paths and _chunk_stats["succeeded"] == 0:
+                # semantic extraction was requested and no chunks completed
+                # (on the fallback either, when one was configured), fail
+                # instead of writing an AST-only graph with exit 0.
+                if (
+                    uncached_paths
+                    and _chunk_stats["succeeded"] == 0
+                    and _primary_work_state != "usable"
+                ):
                     print(
                         f"[graphify extract] error: all semantic chunks failed "
-                        f"for backend '{backend}' ({len(uncached_paths)} uncached files) - "
+                        f"for backend '{_last_backend}' ({len(uncached_paths)} uncached files) - "
                         f"see per-chunk errors above. If you see 'requires the X package', "
                         f"run `pip install X` and retry.",
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                # Some (but not all) chunks failed — the graph is missing nodes
-                # from the failed chunks, so it must not clobber a larger complete
-                # graph without an explicit --allow-partial override.
+                # Incompleteness is judged on the pass whose result we kept: a
+                # crashed pass, or some (but not all) chunks failed — the graph
+                # is missing nodes from the failed chunks, so it must not
+                # clobber a larger complete graph without an explicit
+                # --allow-partial override.
+                if _chunk_stats["crashed"]:
+                    _extraction_incomplete = True
+                # The paid-work classification decides whether a zero-success
+                # primary may fall back.  A normally completed legacy/API pass
+                # still uses the established chunk-completeness checks below.
+                if (
+                    _chunk_stats["succeeded"] == 0
+                    and _primary_work_state in ("usable", "uncertain")
+                ):
+                    _extraction_incomplete = True
                 if _chunk_stats["total"] and _chunk_stats["succeeded"] < _chunk_stats["total"]:
                     _extraction_incomplete = True
                 # #2926: scope the fresh result to the files actually dispatched,
@@ -4021,6 +4287,7 @@ def dispatch_command(cmd: str) -> None:
                         mode=sem_cache_mode,
                         prompt=sem_prompt,
                         partial_source_files=_partial_semantic_files or None,
+                        attachment_compatibility=_attachment_compatibility,
                     )
                 except Exception as exc:
                     print(f"[graphify extract] warning: could not write semantic cache: {exc}", file=sys.stderr)
@@ -4371,6 +4638,8 @@ def dispatch_command(cmd: str) -> None:
                     prune_sources=_prune_sources or None,
                     dedup=not no_dedup,
                     dedup_llm_backend=dedup_backend,
+                    dedup_llm_model=model if dedup_backend else None,
+                    dedup_llm_effort=effort if dedup_backend else None,
                     root=target,
                 )
                 _shrink = _handle_unverified_semantic_shrink(
@@ -4398,7 +4667,11 @@ def dispatch_command(cmd: str) -> None:
                 print(f"[graphify extract] {exc}", file=sys.stderr)
                 sys.exit(1)
         else:
-            G = _build([merged], dedup=not no_dedup, dedup_llm_backend=dedup_backend, root=target)
+            G = _build(
+                [merged], dedup=not no_dedup, dedup_llm_backend=dedup_backend,
+                dedup_llm_model=model if dedup_backend else None,
+                dedup_llm_effort=effort if dedup_backend else None, root=target,
+            )
         stages.mark("build")
         if G.number_of_nodes() == 0:
             print(

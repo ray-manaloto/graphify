@@ -84,9 +84,11 @@ def test_label_cli_passes_model_override(tmp_path, monkeypatch):
     captured = {}
 
     def fake_generate(G, communities, *, backend=None, model=None, gods=None,
-                      quiet=False, max_concurrency=4, batch_size=100, usage_out=None):
+                      quiet=False, max_concurrency=4, batch_size=100, usage_out=None,
+                      effort=None):
         captured["backend"] = backend
         captured["model"] = model
+        captured["effort"] = effort
         captured["max_concurrency"] = max_concurrency
         captured["batch_size"] = batch_size
         return {0: "Orders"}, "llm"
@@ -104,6 +106,8 @@ def test_label_cli_passes_model_override(tmp_path, monkeypatch):
             "gemini",
             "--model",
             "gemini-3.1-flash-lite",
+            "--effort",
+            "high",
             "--max-concurrency",
             "8",
             "--batch-size",
@@ -117,7 +121,7 @@ def test_label_cli_passes_model_override(tmp_path, monkeypatch):
     # Also verifies the space-separated forms parse (the value must not be mistaken
     # for the positional path) and reach generate_community_labels.
     assert captured == {
-        "backend": "gemini", "model": "gemini-3.1-flash-lite",
+        "backend": "gemini", "model": "gemini-3.1-flash-lite", "effort": "high",
         "max_concurrency": 8, "batch_size": 50,
     }
 

@@ -1401,8 +1401,14 @@ def build(
     directed: bool = False,
     dedup: bool = True,
     dedup_llm_backend: str | None = None,
+    dedup_llm_model: str | None = None,
+    dedup_llm_effort: str | None = None,
     root: str | Path | None = None,
     protected_ids: "set[str] | None" = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner=None,
+    receipt_sink=None,
 ) -> nx.Graph:
     """Merge multiple extraction results into one graph.
 
@@ -1458,6 +1464,12 @@ def build(
             # survivor rewiring the edges get (#2805).
             hyperedges=combined.get("hyperedges"),
             protected_ids=protected_ids,
+            dedup_llm_model=dedup_llm_model or (execution_profile or {}).get("model"),
+            dedup_llm_effort=dedup_llm_effort or (execution_profile or {}).get("effort"),
+            execution_profile=execution_profile,
+            run_context=run_context,
+            process_runner=process_runner,
+            receipt_sink=receipt_sink,
         )
     return build_from_json(combined, directed=directed, root=_root)
 
@@ -1792,8 +1804,14 @@ def build_merge(
     directed: bool | None = None,
     dedup: bool = True,
     dedup_llm_backend: str | None = None,
+    dedup_llm_model: str | None = None,
+    dedup_llm_effort: str | None = None,
     root: str | Path | None = None,
     ast_sources: "Iterable[str | Path] | None" = None,
+    execution_profile: dict | None = None,
+    run_context: dict | None = None,
+    process_runner=None,
+    receipt_sink=None,
 ) -> nx.Graph:
     """Load existing graph.json and return it merged with ``new_chunks``.
 
@@ -2043,8 +2061,14 @@ def build_merge(
         directed=directed,
         dedup=dedup,
         dedup_llm_backend=dedup_llm_backend,
+        dedup_llm_model=dedup_llm_model,
+        dedup_llm_effort=dedup_llm_effort,
         root=_eff_root,
         protected_ids=_protected_ids,
+        execution_profile=execution_profile,
+        run_context=run_context,
+        process_runner=process_runner,
+        receipt_sink=receipt_sink,
     )
 
     # Prune nodes and edges from deleted source files
