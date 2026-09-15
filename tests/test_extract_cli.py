@@ -590,6 +590,25 @@ def test_extract_mode_deep_dispatches_over_warm_cache(monkeypatch, tmp_path):
     assert any((corpus / "graphify-out" / "cache" / "semantic-deep").glob("**/*.json"))
 
 
+def test_extract_forwards_primary_model_and_effort(monkeypatch, tmp_path):
+    corpus = _make_corpus(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+    calls: list[dict] = []
+    monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _recording_extractor(calls))
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+
+    _run_extract(
+        monkeypatch,
+        [
+            "graphify", "extract", str(corpus), "--backend", "claude",
+            "--model", "claude-opus-4-1", "--effort", "high", "--no-cluster",
+        ],
+    )
+
+    assert calls[0]["kwargs"]["model"] == "claude-opus-4-1"
+    assert calls[0]["kwargs"]["effort"] == "high"
+
+
 def test_extract_force_flag_redispatches_and_stamps_manifest(monkeypatch, tmp_path):
     """extract accepts --force: a warm tree re-dispatches every semantic file
     (cache read skipped, incremental gate off) and the manifest is still

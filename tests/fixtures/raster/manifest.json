@@ -1,0 +1,78 @@
+{
+  "fixtures": [
+    {
+      "byte_count": 85,
+      "path": "tests/fixtures/raster/alpha.png",
+      "purpose": "RGBA alpha and transparency metadata",
+      "sha256": "1c07974a34d33ba6f297f05eae169e52b56e072f417d8bbbfbf3bbe5e3c6d8d8"
+    },
+    {
+      "byte_count": 708,
+      "path": "tests/fixtures/raster/oriented.jpg",
+      "purpose": "JPEG with EXIF orientation 6",
+      "sha256": "b6d05b8bf7a5bc77ba5659aadca852e9b661e943aae5d6bc0a4047e76b132b3e"
+    },
+    {
+      "byte_count": 48,
+      "path": "tests/fixtures/raster/palette.gif",
+      "purpose": "static one-frame palette GIF without loop metadata",
+      "sha256": "ae9e2cec19cf6a72f2374e2fa94855979b34e20427e3744b9498a62932704f2f"
+    },
+    {
+      "byte_count": 66,
+      "path": "tests/fixtures/raster/static.webp",
+      "purpose": "static lossless WebP",
+      "sha256": "7475d9b164a555155412e6efbf717ae9d09dac699a5f4971721b074fa8b62e15"
+    },
+    {
+      "byte_count": 73,
+      "path": "tests/fixtures/raster/grayscale.png",
+      "purpose": "grayscale PNG",
+      "sha256": "3b8e0841f29a16dd54b0deb50c289ace96a03655d4e1a3c3adb55aac8a37d7b2"
+    },
+    {
+      "byte_count": 111,
+      "path": "tests/fixtures/raster/animated.gif",
+      "purpose": "two-frame animated GIF rejection",
+      "sha256": "fa09323d645946fc05e54d47d92c2d4171d67cbb93a4a9cc4225495cf00ae674"
+    },
+    {
+      "byte_count": 140,
+      "path": "tests/fixtures/raster/animated.webp",
+      "purpose": "two-frame animated WebP rejection",
+      "sha256": "417af2bcf554708ce2331d3c3558aa0148921e2231ab3e0b9e8989f6a19395f3"
+    },
+    {
+      "byte_count": 211,
+      "path": "tests/fixtures/raster/animated.png",
+      "purpose": "two-frame APNG rejection",
+      "sha256": "5a47c9abc4da807792edba133cd8d82b6b319ffb606326e684c5ecc1be668194"
+    },
+    {
+      "byte_count": 72,
+      "path": "tests/fixtures/raster/single-frame-loop.gif",
+      "purpose": "one-frame GIF animation-container rejection",
+      "sha256": "378619278d72aaf3ad98fe46d05c7be4487dc91d2b382a1f4b6f7fefb668b798"
+    },
+    {
+      "byte_count": 70,
+      "path": "tests/fixtures/raster/sample.bmp",
+      "purpose": "unsupported BMP rejection",
+      "sha256": "970f153e430be851e7ffdc371cd41cfff14990ab3a98eea34d6c0630d30fff71"
+    },
+    {
+      "byte_count": 1372,
+      "path": "tests/fixtures/raster/sample.mpo",
+      "purpose": "unsupported multi-picture JPEG container rejection",
+      "sha256": "e426d9f6f1c7e2e9442c9fd40749730a99d68f29d5bde2d5e4212ca7aab68a20"
+    }
+  ],
+  "generator_decoder": {
+    "name": "Pillow",
+    "version": "12.3.0"
+  },
+  "limits": [
+    "Committed byte hashes establish fixture identity. Exact regeneration can vary with decoder/codec builds, so tests consume committed bytes rather than regenerate them."
+  ],
+  "schema_version": 1
+}
