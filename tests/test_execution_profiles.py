@@ -107,6 +107,61 @@ def test_public_deep_prompt_admits_matching_managed_checkpoint(tmp_path: Path) -
     )[-1] == [str(doc)]
 
 
+@pytest.mark.parametrize("mode", [None, "deep"])
+def test_claude_managed_policy_invalidates_legacy_checkpoint(
+    tmp_path: Path, monkeypatch, mode
+):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    doc = corpus / "source.md"
+    doc.write_text("# Source\nA decision and rationale.\n")
+    output = tmp_path / "output"
+    profile = _profile("claude-cli")
+    context = _context(tmp_path)
+    prompt = llm.extraction_system_prompt(deep=mode == "deep")
+    resolved = execution.resolve_execution_profile(
+        None, None, None, execution_profile=profile, purpose="extract"
+    )
+    legacy_payload = {
+        "schema_version": 1,
+        "mode": mode,
+        "profile": execution.execution_profile_fingerprint(resolved),
+        "prompt": cache._resolve_prompt_fp(prompt, None),
+        "extractor_identity": context["extractor_identity"],
+        "configuration_identity": context["configuration_identity"],
+        "instruction_identity": context["instruction_identity"],
+    }
+    legacy_fp = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    original = cache._semantic_compatibility_fingerprint
+    monkeypatch.setattr(cache, "_semantic_compatibility_fingerprint", lambda *a, **kw: legacy_fp)
+    old_receipt = {"receipt_id": "unconfined-producer", "completion": "completed"}
+    assert cache.save_semantic_cache(
+        [{"id": "old", "source_file": str(doc)}], [], root=corpus,
+        cache_root=output, mode=mode, prompt=prompt,
+        execution_profile=profile, run_context=context, producer_receipt=old_receipt,
+    ) == 1
+    monkeypatch.setattr(cache, "_semantic_compatibility_fingerprint", original)
+    assert cache.check_semantic_cache(
+        [str(doc)], root=corpus, cache_root=output, mode=mode, prompt=prompt,
+        execution_profile=profile, run_context=context,
+    )[-1] == [str(doc)]
+    new_receipt = {"receipt_id": "confined-producer", "completion": "completed"}
+    assert cache.save_semantic_cache(
+        [{"id": "new", "source_file": str(doc)}], [], root=corpus,
+        cache_root=output, mode=mode, prompt=prompt,
+        execution_profile=profile, run_context=context, producer_receipt=new_receipt,
+    ) == 1
+    evidence: list[dict] = []
+    nodes, _, _, uncached = cache.check_semantic_cache(
+        [str(doc)], root=corpus, cache_root=output, mode=mode, prompt=prompt,
+        execution_profile=profile, run_context=context, cache_evidence_out=evidence,
+    )
+    assert [node["id"] for node in nodes] == ["new"] and not uncached
+    assert evidence[0]["producer_receipts"] == [new_receipt]
+
+
 def test_public_raster_admission_keys_managed_deep_cache(tmp_path: Path) -> None:
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -522,6 +577,28 @@ def test_managed_openai_extraction_uses_shared_builder_and_accepts_empty_graph(t
     }
 
 
+def test_managed_claude_extract_rejects_resultless_event_array(tmp_path):
+    receipts: list[dict] = []
+
+    def runner(request):
+        process = _process(request)
+        events = [{"type": "assistant", "result": '{"nodes":[{"id":"early"}],"edges":[]}'}]
+        process["stdout"] = json.dumps(events).encode()
+        process["provider_events"] = events
+        return process
+
+    with pytest.raises(RuntimeError, match="no result object") as caught:
+        llm._managed_cli_call(
+            "extract both files", backend="claude-cli", purpose="extract", max_tokens=200,
+            deep_mode=True, images=None, model=_profile("claude-cli")["model"],
+            effort="high", execution_profile=_profile("claude-cli"),
+            run_context=_context(tmp_path), process_runner=runner,
+            receipt_sink=_ack(receipts),
+        )
+    assert getattr(caught.value, "graphify_attempt")["receipt"]["completion"] == "incomplete_capture"
+    assert receipts[0]["coverage"]["reasons"] == ["result_parser_failed", "response_identity_missing"]
+
+
 @pytest.mark.parametrize("purpose", ["label", "dedup", "triage"])
 def test_managed_openai_auxiliary_call_uses_same_profile(tmp_path, purpose):
     requests: list[dict] = []
@@ -616,6 +693,47 @@ def test_managed_claude_receipt_distinguishes_unknown_usage_from_zero(
     assert usage["input_tokens"] == usage["output_tokens"] == 0
     assert usage["input_tokens_known"] is known
     assert usage["output_tokens_known"] is known
+
+
+def test_managed_claude_deep_extract_confines_actual_and_recorded_invocation(tmp_path):
+    requests: list[dict] = []
+    receipts: list[dict] = []
+    nonterminal = '{"nodes":[{"id":"early"}],"edges":[],"hyperedges":[]}'
+    terminal = '{"nodes":[],"edges":[],"hyperedges":[]}'
+
+    def runner(request):
+        requests.append(request)
+        process = _process(request)
+        events = [
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": nonterminal}]}},
+            {"type": "result", "result": terminal},
+        ]
+        process["stdout"] = json.dumps(events).encode()
+        process["provider_events"] = events
+        return process
+
+    outcome = llm._managed_cli_call(
+        "extract both files", backend="claude-cli", purpose="extract", max_tokens=200,
+        deep_mode=True, images=None, model=_profile("claude-cli")["model"],
+        effort="high", execution_profile=_profile("claude-cli"),
+        run_context=_context(tmp_path), process_runner=runner,
+        receipt_sink=_ack(receipts),
+    )
+
+    assert requests[0]["argv"][-3:] == ["--safe-mode", "--tools", "Read"]
+    assert receipts[0]["request"]["argv"] == requests[0]["argv"]
+    assert outcome["value"]["nodes"] == []
+    assert receipts[0]["completion"] == "completed_empty"
+
+    llm._managed_cli_call(
+        "extract both files", backend="claude-cli", purpose="extract", max_tokens=200,
+        deep_mode=False, images=None, model=_profile("claude-cli")["model"],
+        effort="high", execution_profile=_profile("claude-cli"),
+        run_context=_context(tmp_path), process_runner=runner,
+        receipt_sink=_ack(receipts),
+    )
+    assert "--safe-mode" not in requests[1]["argv"]
+    assert "--tools" not in requests[1]["argv"]
 
 
 @pytest.mark.parametrize("backend", ["openai-cli", "claude-cli"])

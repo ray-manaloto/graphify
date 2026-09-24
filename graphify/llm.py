@@ -26,6 +26,7 @@ from graphify.file_slice import (
     unit_path,
 )
 from graphify.execution import (
+    MANAGED_CLAUDE_DEEP_ARGS,
     build_cli_invocation,
     resolve_execution_profile,
     run_cli_invocation,
@@ -1842,7 +1843,7 @@ def _envelope_after_preamble(stdout: str):
     return None
 
 
-def _claude_cli_envelope(stdout: str) -> dict:
+def _claude_cli_envelope(stdout: str, *, require_terminal: bool = False) -> dict:
     """Parse the JSON returned by `claude -p --output-format json`.
 
     Older Claude Code CLI versions returned a single envelope object. Newer
@@ -1867,6 +1868,8 @@ def _claude_cli_envelope(stdout: str) -> dict:
         ]
         if result_events:
             return result_events[-1]
+        if require_terminal:
+            raise RuntimeError("claude -p returned a JSON array with no result object")
         if envelope and isinstance(envelope[-1], dict):
             return envelope[-1]
         raise RuntimeError(
@@ -2102,6 +2105,10 @@ def _managed_cli_call(
             cwd=actual_cwd,
             legacy_mcp_args=legacy_mcp_args,
         )
+        if effective_managed and backend == "claude-cli" and purpose == "extract" and deep_mode:
+            # Keep source reading available while excluding project customizations
+            # and unrelated tools from a managed graph-only extraction.
+            invocation["argv"].extend(MANAGED_CLAUDE_DEEP_ARGS)
         if (
             backend == "claude-cli"
             and purpose == "extract"
@@ -2122,7 +2129,9 @@ def _managed_cli_call(
                     raise RuntimeError(f"claude -p exited {process['returncode']}: {detail[:500]}")
                 if cli_error:
                     raise RuntimeError(f"claude -p reported an error: {cli_error[:500]}")
-                envelope = _claude_cli_envelope(stdout)
+                envelope = _claude_cli_envelope(
+                    stdout, require_terminal=effective_managed and purpose == "extract"
+                )
                 structured = envelope.get("structured_output")
                 raw_content = (
                     json.dumps(structured)
