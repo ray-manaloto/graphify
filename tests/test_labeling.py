@@ -11,7 +11,7 @@ from pathlib import Path
 import networkx as nx
 import pytest
 
-from graphify.llm import label_communities, generate_community_labels
+from graphify.llm import label_communities, generate_community_labels, _label_batch_with_retry
 
 
 def _graph():
@@ -64,6 +64,38 @@ def test_label_communities_passes_model_override(monkeypatch):
 
     assert labels == {0: "Order Management", 1: "Payment Flow"}
     assert captured == {"backend": "gemini", "model": "gemini-3.1-flash-lite"}
+
+
+def test_partial_label_retry_preserves_managed_execution_context(monkeypatch):
+    calls = []
+    profile = {"backend": "openai-cli", "model": "gpt-5.6-sol", "effort": "high"}
+    context = {"source": "graphify"}
+    runner = object()
+    sink = object()
+    usage = {}
+
+    def fake_call(prompt, **kwargs):
+        calls.append(kwargs)
+        return '{"0": "Orders"}' if len(calls) == 1 else '{"1": "Payments"}'
+
+    monkeypatch.setattr("graphify.llm._call_llm", fake_call)
+    labels = _label_batch_with_retry(
+        [0, 1], ["0: order", "1: payment"],
+        backend="openai-cli", model="gpt-5.6-sol", effort="high",
+        execution_profile=profile, run_context=context,
+        process_runner=runner, receipt_sink=sink, usage_out=usage,
+    )
+
+    assert labels == {0: "Orders", 1: "Payments"}
+    assert len(calls) == 2
+    for call in calls:
+        assert call["model"] == "gpt-5.6-sol"
+        assert call["effort"] == "high"
+        assert call["execution_profile"] is profile
+        assert call["run_context"] is context
+        assert call["process_runner"] is runner
+        assert call["receipt_sink"] is sink
+        assert call["usage_out"] is usage
 
 
 def test_label_cli_passes_model_override(tmp_path, monkeypatch):
