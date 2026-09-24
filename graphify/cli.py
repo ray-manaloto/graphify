@@ -4208,11 +4208,15 @@ def dispatch_command(cmd: str) -> None:
                             f"[graphify extract] semantic extraction failed: {exc}",
                             file=sys.stderr,
                         )
-                        fresh = dict(_empty)
+                        partial = getattr(exc, "graphify_partial_result", None)
+                        fresh = {**_empty, **partial} if isinstance(partial, dict) else dict(_empty)
                         attempt = getattr(exc, "graphify_attempt", None)
                         receipt = attempt.get("receipt") if isinstance(attempt, dict) else None
                         if isinstance(receipt, dict):
-                            fresh["_execution_receipts"] = [receipt]
+                            retained = list(fresh.get("_execution_receipts") or [])
+                            if receipt not in retained:
+                                retained.append(receipt)
+                            fresh["_execution_receipts"] = retained
                         chunk_stats["crashed"] = True  # the semantic pass crashed
                     return fresh, chunk_stats
 
