@@ -1178,6 +1178,24 @@ def _is_watch_injection_fix_line(line: str) -> bool:
         or stripped == "Replace INPUT_PATH with the folder to watch. Behavior depends on what changed:"
         or stripped == "This watches the same folder graphify extracted, read from the trusted `graphify-out/.graphify_root` that Step 1 resolved - there is no path to substitute, so a scan root containing shell metacharacters can never be re-interpreted here. Behavior depends on what changed:"
     )
+_MONOLITH_ROOT_READ = "open('graphify-out/.graphify_root', encoding='utf-8').read()"
+_MONOLITH_LITERAL_ROOT_LINES = {
+    "result = detect(Path('INPUT_PATH'))",
+    f"result = detect(Path({_MONOLITH_ROOT_READ}))",
+    "result = detect_incremental(Path('INPUT_PATH'))",
+    f"result = detect_incremental(Path({_MONOLITH_ROOT_READ}))",
+    "report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, 'INPUT_PATH', suggested_questions=questions)",
+    f"report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, {_MONOLITH_ROOT_READ}, suggested_questions=questions)",
+    "report = generate(G, communities, cohesion, labels, analysis['gods'], analysis['surprises'], detection, tokens, 'INPUT_PATH', suggested_questions=questions)",
+    f"report = generate(G, communities, cohesion, labels, analysis['gods'], analysis['surprises'], detection, tokens, {_MONOLITH_ROOT_READ}, suggested_questions=questions)",
+    "Replace INPUT_PATH with the actual path the user provided. Do NOT cat or print the JSON - read it silently and present a clean summary instead:",
+    "Replace INPUT_PATH with the actual path.",
+}
+
+
+def _is_monolith_literal_root_fix_line(line: str) -> bool:
+    """Allow only the explicit old/new lines for monolith path-as-data repair."""
+    return line in _MONOLITH_LITERAL_ROOT_LINES
 
 
 # Every line that may differ between a rendered monolith and its pristine v8
@@ -1203,6 +1221,7 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_community_label_export_fix_line,
     _is_step1_root_marker_fix_line,
     _is_watch_injection_fix_line,
+    _is_monolith_literal_root_fix_line,
 )
 
 

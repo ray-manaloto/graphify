@@ -607,6 +607,31 @@ def test_managed_partial_label_retry_failure_retains_earlier_name(monkeypatch, t
     assert caught.value.graphify_partial_labels == {0: "Orders"}
 
 
+def test_managed_malformed_missing_label_keeps_valid_partial_without_repeating(monkeypatch, tmp_path):
+    graph, communities = _two_community_graph()
+    calls = 0
+
+    def fake_call(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return '{"0": "Orders"}'
+        if calls == 2:
+            return "not json"
+        raise AssertionError("a completed label was sent again")
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    with pytest.raises(ValueError, match="not parseable JSON") as caught:
+        llm.generate_community_labels(
+            graph, communities, backend="openai-cli", execution_profile=_profile(),
+            run_context=_context(tmp_path), process_runner=object(),
+            receipt_sink=object(),
+        )
+
+    assert calls == 2
+    assert caught.value.graphify_partial_labels == {0: "Orders"}
+
+
 def test_managed_malformed_label_split_retains_successful_left_name(monkeypatch, tmp_path):
     graph, communities = _two_community_graph()
     replies = iter(['not json', '{"0": "Orders"}'])
