@@ -889,6 +889,30 @@ def test_crossfile_identical_concepts_merge_and_rewire():
         {"source": "sz_intl", "target": "port_ops", "relation": "operates"}]
 
 
+def test_crossfile_label_merge_retains_each_source_location():
+    nodes = [
+        {"id": "findings_rationale", "label": "Rationale (column)",
+         "file_type": "document", "source_file": "findings.md",
+         "source_location": "L21"},
+        {"id": "task_plan_rationale", "label": "Rationale (column)",
+         "file_type": "document", "source_file": "task_plan.md",
+         "source_location": "L69"},
+    ]
+    edges = [
+        {"source": "findings_rationale", "target": "task_plan_rationale",
+         "relation": "references", "source_file": "findings.md"},
+    ]
+    result_nodes, result_edges = deduplicate_entities(nodes, edges, communities={})
+    assert len(result_nodes) == 1
+    assert result_nodes[0]["source_provenance"] == [
+        {"node_id": "findings_rationale", "source_file": "findings.md",
+         "source_location": "L21"},
+        {"node_id": "task_plan_rationale", "source_file": "task_plan.md",
+         "source_location": "L69"},
+    ]
+    assert result_edges == []  # The self-edge disappears after the merge.
+
+
 def test_crossfile_one_char_typo_concepts_still_merge():
     """Non-regression: the near-identical (one-char-different) cross-file pair
     that already merged via Pass 2 fuzzy matching must keep merging (#2182)."""

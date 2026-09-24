@@ -475,6 +475,26 @@ def _merge_missing_attributes(survivor: dict, duplicate: dict) -> dict:
     return merged
 
 
+def _merged_source_provenance(nodes: list[dict]) -> list[dict]:
+    """Retain every source that contributed to a label-merged entity."""
+    entries: set[tuple[str, str, str]] = set()
+    for node in nodes:
+        source_file = node.get("source_file")
+        if source_file:
+            entries.add((str(node["id"]), str(source_file),
+                         str(node.get("source_location") or "")))
+        for prior in node.get("source_provenance") or []:
+            if isinstance(prior, dict) and prior.get("source_file"):
+                entries.add((str(prior.get("node_id") or node["id"]),
+                             str(prior["source_file"]),
+                             str(prior.get("source_location") or "")))
+    return [
+        {"node_id": node_id, "source_file": source_file,
+         "source_location": location or None}
+        for node_id, source_file, location in sorted(entries)
+    ]
+
+
 def _report_id_collision(nid: str, survivor: dict, losers: list[dict]) -> None:
     """Report an ID collision in proportion to what dropping the loser actually costs.
 
@@ -1005,6 +1025,9 @@ def deduplicate_entities(
         for node in group_nodes:
             if node["id"] != winner_id:
                 merged = _merge_missing_attributes(merged, node)
+        provenance = _merged_source_provenance(group_nodes)
+        if len({entry["source_file"] for entry in provenance}) > 1:
+            merged = dict(merged, source_provenance=provenance)
         if merged != winner:
             enriched_by_id[winner_id] = merged
         for member in members:
@@ -1069,6 +1092,7 @@ def deduplicate_entities(
 # the richness score below ignores them.
 _RICHNESS_IGNORED_KEYS = frozenset({
     "id", "label", "norm_label", "file_type", "source_file", "source_location",
+    "source_provenance",
 })
 
 
