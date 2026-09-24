@@ -1332,6 +1332,7 @@ requires-dist = [
     { name = "openpyxl", marker = "extra == 'google'" },
     { name = "openpyxl", marker = "extra == 'office'" },
     { name = "pillow", marker = "extra == 'all'", specifier = "==12.3.0" },
+    { name = "pillow", marker = "extra == 'all'", specifier = ">=12.3.0" },
     { name = "pillow", marker = "extra == 'images'", specifier = "==12.3.0" },
     { name = "pillow", marker = "extra == 'svg'", specifier = ">=12.3.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'all'" },
