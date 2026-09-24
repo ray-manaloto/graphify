@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import networkx as nx
 import pytest
 
 from graphify import cache, execution, llm
@@ -454,6 +455,177 @@ def test_managed_openai_auxiliary_call_uses_same_profile(tmp_path, purpose):
     assert requests[0]["requested_profile"]["effort"] == "high"
     assert requests[0]["purpose"] == purpose
     assert usage["_execution_receipts"] == receipts
+
+
+@pytest.mark.parametrize(
+    ("event", "expected", "counts"),
+    [
+        ({"type": "turn.completed"}, (False, False), (0, 0)),
+        ({"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
+         (True, True), (0, 0)),
+        ({"type": "turn.completed", "usage": {"input_tokens": 7}},
+         (True, False), (7, 0)),
+        ({"type": "turn.completed", "usage": {"input_tokens": "7", "output_tokens": 0}},
+         (False, True), (0, 0)),
+        ({"type": "turn.completed", "usage": {"input_tokens": True, "output_tokens": -2}},
+         (False, False), (0, 0)),
+    ],
+)
+def test_managed_codex_receipt_distinguishes_unknown_usage_from_zero(
+    tmp_path, event, expected, counts
+):
+    receipts: list[dict] = []
+    aggregate: dict = {}
+
+    def runner(request):
+        process = _process(request, payload=b"A concise label")
+        process["stdout"] = (json.dumps(event) + "\n").encode()
+        return process
+
+    llm._call_llm(
+        "name this cluster", backend="openai-cli", model="gpt-5.6-sol",
+        effort="high", execution_profile=_profile(), run_context=_context(tmp_path),
+        process_runner=runner, receipt_sink=_ack(receipts), purpose="label",
+        usage_out=aggregate,
+    )
+
+    usage = receipts[0]["usage"]
+    assert (usage["input_tokens_known"], usage["output_tokens_known"]) == expected
+    assert (usage["input_tokens"], usage["output_tokens"]) == counts
+    assert (aggregate["input_tokens_known"], aggregate["output_tokens_known"]) == expected
+
+
+@pytest.mark.parametrize("reported_usage, known", [(None, False), ({"input_tokens": 0, "output_tokens": 0}, True)])
+def test_managed_claude_receipt_distinguishes_unknown_usage_from_zero(
+    tmp_path, reported_usage, known
+):
+    receipts: list[dict] = []
+
+    def runner(request):
+        process = _process(request, reported_model="claude-opus-4-1")
+        envelope = {"type": "result", "result": "A concise label"}
+        if reported_usage is not None:
+            envelope["usage"] = reported_usage
+        process["stdout"] = json.dumps(envelope).encode()
+        return process
+
+    llm._call_llm(
+        "name this cluster", backend="claude-cli", model="claude-opus-4-1",
+        effort="high", execution_profile=_profile("claude-cli"),
+        run_context=_context(tmp_path), process_runner=runner,
+        receipt_sink=_ack(receipts), purpose="label",
+    )
+
+    usage = receipts[0]["usage"]
+    assert usage["input_tokens"] == usage["output_tokens"] == 0
+    assert usage["input_tokens_known"] is known
+    assert usage["output_tokens_known"] is known
+
+
+@pytest.mark.parametrize("backend", ["openai-cli", "claude-cli"])
+def test_managed_extraction_retains_usage_certainty_in_receipt(tmp_path, backend):
+    receipts: list[dict] = []
+
+    def runner(request):
+        process = _process(request)
+        if backend == "claude-cli":
+            process["stdout"] = json.dumps({
+                "type": "result",
+                "structured_output": {"nodes": [], "edges": [], "hyperedges": []},
+            }).encode()
+        return process
+
+    outcome = llm._managed_cli_call(
+        "extract this", backend=backend, purpose="extract", max_tokens=200,
+        deep_mode=False, images=None, model=_profile(backend)["model"],
+        effort="high", execution_profile=_profile(backend),
+        run_context=_context(tmp_path), process_runner=runner,
+        receipt_sink=_ack(receipts),
+    )
+
+    assert outcome["receipt"] == receipts[0]
+    assert outcome["receipt"]["usage"]["input_tokens_known"] is False
+    assert outcome["receipt"]["usage"]["output_tokens_known"] is False
+
+
+def test_chunk_usage_unknown_absorbs_known_subtotal():
+    merged = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    llm._merge_into(merged, {
+        "input_tokens": 5, "output_tokens": 7,
+        "_execution_receipts": [{"usage": {"input_tokens_known": True, "output_tokens_known": True}}],
+    })
+    llm._merge_into(merged, {
+        "input_tokens": 0, "output_tokens": 0,
+        "_execution_receipts": [{"usage": {"input_tokens_known": False, "output_tokens_known": False}}],
+    })
+    assert (merged["input_tokens"], merged["output_tokens"]) == (5, 7)
+    assert merged["input_tokens_known"] is False
+    assert merged["output_tokens_known"] is False
+
+
+def _two_community_graph():
+    graph = nx.Graph()
+    graph.add_node("orders", label="Orders")
+    graph.add_node("payments", label="Payments")
+    return graph, {0: ["orders"], 1: ["payments"]}
+
+
+def test_managed_partial_label_omission_raises_with_salvaged_names(monkeypatch, tmp_path):
+    graph, communities = _two_community_graph()
+    monkeypatch.setattr(llm, "_call_llm", lambda *args, **kwargs: '{"0": "Orders"}')
+
+    with pytest.raises(RuntimeError, match="missing") as caught:
+        llm.generate_community_labels(
+            graph, communities, backend="openai-cli", execution_profile=_profile(),
+            run_context=_context(tmp_path), process_runner=object(),
+            receipt_sink=object(),
+        )
+
+    assert caught.value.graphify_partial_labels == {0: "Orders"}
+
+
+def test_managed_partial_label_retry_failure_retains_earlier_name(monkeypatch, tmp_path):
+    graph, communities = _two_community_graph()
+    calls = 0
+
+    def fake_call(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return '{"0": "Orders"}'
+        raise RuntimeError("transport uncertain")
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    with pytest.raises(RuntimeError, match="transport uncertain") as caught:
+        llm.generate_community_labels(
+            graph, communities, backend="openai-cli", execution_profile=_profile(),
+            run_context=_context(tmp_path), process_runner=object(),
+            receipt_sink=object(),
+        )
+
+    assert calls == 2
+    assert caught.value.graphify_partial_labels == {0: "Orders"}
+
+
+def test_managed_malformed_label_split_retains_successful_left_name(monkeypatch, tmp_path):
+    graph, communities = _two_community_graph()
+    replies = iter(['not json', '{"0": "Orders"}'])
+
+    def fake_call(*args, **kwargs):
+        try:
+            return next(replies)
+        except StopIteration:
+            raise RuntimeError("right label call failed") from None
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    with pytest.raises(RuntimeError, match="right label call failed") as caught:
+        llm.generate_community_labels(
+            graph, communities, backend="openai-cli", execution_profile=_profile(),
+            run_context=_context(tmp_path), process_runner=object(),
+            receipt_sink=object(),
+        )
+
+    assert caught.value.graphify_partial_labels == {0: "Orders"}
 
 
 def test_extract_files_direct_forwards_managed_transport(monkeypatch, tmp_path):
