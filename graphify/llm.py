@@ -1946,8 +1946,16 @@ def _claude_cli_supports_json_schema(claude_cmd: str) -> bool:
     return supported
 
 
-def _openai_cli_turn_usage(stdout: str) -> tuple[int, int]:
-    """Return token counts from the last Codex ``turn.completed`` JSONL event."""
+def _known_token_count(usage: Mapping, name: str) -> tuple[int, bool]:
+    """Keep an observed zero distinct from a missing or malformed count."""
+    value = usage.get(name)
+    if type(value) is int and value >= 0:
+        return value, True
+    return 0, False
+
+
+def _openai_cli_turn_usage(stdout: str) -> tuple[int, int, bool, bool]:
+    """Return observed counts and certainty from the last Codex completion."""
     completed_usage: dict | None = None
     for line in (stdout or "").splitlines():
         line = line.strip()
@@ -1964,19 +1972,13 @@ def _openai_cli_turn_usage(stdout: str) -> tuple[int, int]:
             completed_usage = usage if isinstance(usage, dict) else {}
 
     if completed_usage is None:
-        # Without a completion event the exact counts are unknown; report zero
-        # rather than estimating or inventing usage.
-        return 0, 0
-
-    def _count(name: str) -> int:
-        try:
-            return int(completed_usage.get(name, 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+        return 0, 0, False, False
 
     # Codex input_tokens already appears to include cached_input_tokens, so do
     # not add the cached count again or usage will be double-counted.
-    return _count("input_tokens"), _count("output_tokens")
+    input_tokens, input_known = _known_token_count(completed_usage, "input_tokens")
+    output_tokens, output_known = _known_token_count(completed_usage, "output_tokens")
+    return input_tokens, output_tokens, input_known, output_known
 
 
 def _openai_cli_vendor_detail(stderr: str, stdout: str) -> str:
@@ -2117,12 +2119,23 @@ def _managed_cli_call(
                     if isinstance(structured, dict)
                     else envelope.get("result", "")
                 )
-                usage = envelope.get("usage") or {}
+                usage = envelope.get("usage")
+                usage = usage if isinstance(usage, dict) else {}
+                input_tokens, input_known = _known_token_count(usage, "input_tokens")
+                cache_read, cache_read_known = (
+                    _known_token_count(usage, "cache_read_input_tokens")
+                    if "cache_read_input_tokens" in usage else (0, True)
+                )
+                cache_created, cache_created_known = (
+                    _known_token_count(usage, "cache_creation_input_tokens")
+                    if "cache_creation_input_tokens" in usage else (0, True)
+                )
+                output_tokens, output_known = _known_token_count(usage, "output_tokens")
                 token_usage = {
-                    "input_tokens": int(usage.get("input_tokens", 0) or 0)
-                    + int(usage.get("cache_read_input_tokens", 0) or 0)
-                    + int(usage.get("cache_creation_input_tokens", 0) or 0),
-                    "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                    "input_tokens": input_tokens + cache_read + cache_created,
+                    "output_tokens": output_tokens,
+                    "input_tokens_known": input_known and cache_read_known and cache_created_known,
+                    "output_tokens_known": output_known,
                 }
                 model_usage = envelope.get("modelUsage") or {}
                 observations = [{"kind": "model_usage_key", "value": key} for key in model_usage]
@@ -2136,17 +2149,21 @@ def _managed_cli_call(
                 if not raw_content.strip():
                     detail = _openai_cli_vendor_detail(stderr, stdout)
                     raise RuntimeError(f"codex exec produced an empty -o output file: {detail}")
-                input_tokens, output_tokens = _openai_cli_turn_usage(stdout)
+                input_tokens, output_tokens, input_known, output_known = (
+                    _openai_cli_turn_usage(stdout)
+                )
                 token_usage = {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
+                    "input_tokens_known": input_known,
+                    "output_tokens_known": output_known,
                 }
                 observations = [{"kind": "requested_model", "value": profile["model"]}]
                 stop_reason = ""
 
             if purpose == "extract":
                 value = _parse_llm_json(raw_content)
-                value.update(token_usage)
+                value.update({key: token_usage[key] for key in ("input_tokens", "output_tokens")})
                 value["model"] = (
                     next(iter(model_usage), "claude-code-plan")
                     if backend == "claude-cli"
@@ -3922,7 +3939,18 @@ def _merge_into(merged: dict, result: dict) -> None:
     merged["hyperedges"].extend(result.get("hyperedges", []))
     merged["input_tokens"] += result.get("input_tokens", 0)
     merged["output_tokens"] += result.get("output_tokens", 0)
-    merged.setdefault("_execution_receipts", []).extend(result.get("_execution_receipts", []))
+    receipts = result.get("_execution_receipts", [])
+    merged.setdefault("_execution_receipts", []).extend(receipts)
+    for name in ("input_tokens_known", "output_tokens_known"):
+        observed = [
+            receipt.get("usage", {}).get(name)
+            for receipt in receipts
+            if isinstance(receipt, dict) and isinstance(receipt.get("usage"), dict)
+        ]
+        known = all(value is True for value in observed) if observed else (
+            result.get(name) is True
+        )
+        merged[name] = merged.get(name, True) and known
     # Carry forward files a chunk truncated to an empty parse (#1950): these have
     # no items to ride the merge, so they'd otherwise be lost from the run-level
     # partial set the manifest stamp consults.
@@ -4048,6 +4076,8 @@ def _call_llm(
         usage = receipt.get("usage") or {}
         _rec(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
         if usage_out is not None and effective_managed:
+            for name in ("input_tokens_known", "output_tokens_known"):
+                usage_out[name] = usage_out.get(name, True) and usage.get(name) is True
             usage_out.setdefault("_execution_receipts", []).append(receipt)
         return outcome["value"]
 
@@ -4453,38 +4483,48 @@ def _label_batch_with_retry(
         # an apparent success (#3671).
         missing = [cid for cid in batch_cids if cid not in parsed]
         if len(batch_cids) <= 1 or depth >= max_depth:
+            if execution_profile is not None or (run_context and run_context.get("capture_required")):
+                error = RuntimeError(f"managed label response missing community ids {missing}")
+                error.__dict__["graphify_partial_labels"] = dict(parsed)
+                raise error
             return parsed
         missing_lines = [
             line for cid, line in zip(batch_cids, batch_lines) if cid in missing
         ]
-        if len(missing) == 1:
-            recovered = _label_batch_with_retry(
-                missing, missing_lines,
-                backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
-                usage_out=usage_out,
-                effort=effort, execution_profile=execution_profile,
-                run_context=run_context, process_runner=process_runner,
-                receipt_sink=receipt_sink,
-            )
-            return parsed | recovered
-        mid = len(missing) // 2
-        left = _label_batch_with_retry(
-            missing[:mid], missing_lines[:mid],
-            backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
-            usage_out=usage_out,
-            effort=effort, execution_profile=execution_profile,
-            run_context=run_context, process_runner=process_runner,
-            receipt_sink=receipt_sink,
-        )
-        right = _label_batch_with_retry(
-            missing[mid:], missing_lines[mid:],
-            backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
-            usage_out=usage_out,
-            effort=effort, execution_profile=execution_profile,
-            run_context=run_context, process_runner=process_runner,
-            receipt_sink=receipt_sink,
-        )
-        return parsed | left | right
+        retained = dict(parsed)
+        try:
+            if len(missing) == 1:
+                recovered = _label_batch_with_retry(
+                    missing, missing_lines,
+                    backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
+                    usage_out=usage_out,
+                    effort=effort, execution_profile=execution_profile,
+                    run_context=run_context, process_runner=process_runner,
+                    receipt_sink=receipt_sink,
+                )
+                retained.update(recovered)
+            else:
+                mid = len(missing) // 2
+                for cids, members in (
+                    (missing[:mid], missing_lines[:mid]),
+                    (missing[mid:], missing_lines[mid:]),
+                ):
+                    recovered = _label_batch_with_retry(
+                        cids, members,
+                        backend=backend, model=model, depth=depth + 1,
+                        max_depth=max_depth, usage_out=usage_out,
+                        effort=effort, execution_profile=execution_profile,
+                        run_context=run_context, process_runner=process_runner,
+                        receipt_sink=receipt_sink,
+                    )
+                    retained.update(recovered)
+        except Exception as exc:
+            nested = getattr(exc, "graphify_partial_labels", None)
+            if isinstance(nested, dict):
+                retained.update(nested)
+            exc.__dict__["graphify_partial_labels"] = retained
+            raise
+        return retained
     except (json.JSONDecodeError, ValueError) as exc:
         # Parse failure. If we can still split, retry each half on a smaller
         # prompt (smaller output → less likely to truncate/mangle). At the base
@@ -4498,23 +4538,28 @@ def _label_batch_with_retry(
             )
             raise
         mid = len(batch_cids) // 2
-        left = _label_batch_with_retry(
-            batch_cids[:mid], batch_lines[:mid],
-            backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
-            usage_out=usage_out,
-            effort=effort, execution_profile=execution_profile,
-            run_context=run_context, process_runner=process_runner,
-            receipt_sink=receipt_sink,
-        )
-        right = _label_batch_with_retry(
-            batch_cids[mid:], batch_lines[mid:],
-            backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
-            usage_out=usage_out,
-            effort=effort, execution_profile=execution_profile,
-            run_context=run_context, process_runner=process_runner,
-            receipt_sink=receipt_sink,
-        )
-        return left | right
+        retained: dict[int, str] = {}
+        try:
+            for cids, members in (
+                (batch_cids[:mid], batch_lines[:mid]),
+                (batch_cids[mid:], batch_lines[mid:]),
+            ):
+                recovered = _label_batch_with_retry(
+                    cids, members,
+                    backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
+                    usage_out=usage_out,
+                    effort=effort, execution_profile=execution_profile,
+                    run_context=run_context, process_runner=process_runner,
+                    receipt_sink=receipt_sink,
+                )
+                retained.update(recovered)
+        except Exception as nested_exc:
+            nested = getattr(nested_exc, "graphify_partial_labels", None)
+            if isinstance(nested, dict):
+                retained.update(nested)
+            nested_exc.__dict__["graphify_partial_labels"] = retained
+            raise
+        return retained
 
 
 def label_communities(
@@ -4617,10 +4662,19 @@ def label_communities(
         if usage_out is not None and batch_usage:
             usage_out["input"] = usage_out.get("input", 0) + batch_usage.get("input", 0)
             usage_out["output"] = usage_out.get("output", 0) + batch_usage.get("output", 0)
+            for name in ("input_tokens_known", "output_tokens_known"):
+                if name in batch_usage:
+                    usage_out[name] = usage_out.get(name, True) and batch_usage[name] is True
             batch_receipts = batch_usage.get("_execution_receipts", [])
             if batch_receipts:
                 usage_out.setdefault("_execution_receipts", []).extend(batch_receipts)
         if exc is not None:
+            partial = getattr(exc, "graphify_partial_labels", None)
+            if isinstance(partial, dict):
+                for cid, name in partial.items():
+                    if cid in labels and isinstance(name, str) and name != f"Community {cid}":
+                        labels[cid] = name
+                        written += 1
             if effective_managed and usage_out is not None:
                 attempt = getattr(exc, "graphify_attempt", None)
                 receipt = attempt.get("receipt") if isinstance(attempt, dict) else None
@@ -4630,6 +4684,12 @@ def label_communities(
                         item.get("receipt_id") == receipt.get("receipt_id") for item in retained
                     ):
                         retained.append(receipt)
+                    failed_usage = receipt.get("usage")
+                    failed_usage = failed_usage if isinstance(failed_usage, dict) else {}
+                    for name in ("input_tokens_known", "output_tokens_known"):
+                        usage_out[name] = (
+                            usage_out.get(name, True) and failed_usage.get(name) is True
+                        )
             errors[batch_idx] = exc
             start = batch_idx * batch_size
             end = min(start + batch_size, len(labeled_cids))
