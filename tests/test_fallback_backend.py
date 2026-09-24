@@ -326,6 +326,58 @@ def test_preserved_leaf_blocks_fallback_without_success_callback(
     assert "retrying once with fallback backend" not in captured.out
 
 
+def test_raised_partial_primary_keeps_facts_and_blocks_fallback(
+    monkeypatch, tmp_path, capsys
+):
+    from graphify.execution import paid_work_state
+
+    calls = []
+    seen_receipts = []
+    kept = {
+        "id": "kept", "label": "Kept", "type": "concept",
+        "source_file": "README.md",
+    }
+
+    def _raises_after_left(paths, **kwargs):
+        calls.append(kwargs["backend"])
+        error = RuntimeError("right chunk failed")
+        error.graphify_partial_result = {
+            "nodes": [kept], "edges": [], "hyperedges": [],
+            "input_tokens": 12, "output_tokens": 6,
+            "_execution_receipts": [{
+                "receipt_id": "kept-receipt", "completion": "partial",
+                "coverage": {"status": "unproved", "reasons": ["right_failed"]},
+            }],
+            "_partial_files": [str(paths[-1])],
+        }
+        error.graphify_attempt = {"receipt": {
+            "receipt_id": "failed-receipt", "completion": "failed_after_response",
+            "coverage": {"status": "unproved", "reasons": ["right_failed"]},
+        }}
+        raise error
+
+    def _record_paid_state(receipts, cache_hits):
+        seen_receipts.extend(receipts)
+        return paid_work_state(receipts, cache_hits)
+
+    monkeypatch.setattr("graphify.execution.paid_work_state", _record_paid_state)
+
+    _corpus, out_dir = _arm(
+        monkeypatch, tmp_path, _raises_after_left,
+        extra_argv=["--fallback-backend", "openai", "--allow-partial"],
+    )
+    _run_ok()
+
+    assert calls == ["claude"]
+    assert [item["receipt_id"] for item in seen_receipts] == [
+        "kept-receipt", "failed-receipt",
+    ]
+    assert "kept" in (out_dir / "graphify-out" / "graph.json").read_text()
+    captured = capsys.readouterr()
+    assert "fallback blocked" in captured.err
+    assert "12 in / 6 out" in captured.out
+
+
 def test_import_error_without_fallback_stays_fatal(monkeypatch, tmp_path, capsys):
     calls = []
     stub = _recording_stub(
