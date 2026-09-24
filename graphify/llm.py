@@ -544,6 +544,11 @@ def _extraction_system(*, deep: bool = False) -> str:
     return _EXTRACTION_SYSTEM + _DEEP_EXTRACTION_SUFFIX
 
 
+def extraction_system_prompt(*, deep: bool = False) -> str:
+    """Expose the exact prompt fingerprint used by semantic cache checkpoints."""
+    return _extraction_system(deep=deep)
+
+
 def _file_to_text(path: Path) -> str:
     """Return a text-like file's content for the extraction prompt.
 
