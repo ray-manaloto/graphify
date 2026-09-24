@@ -4462,6 +4462,9 @@ def _label_batch_with_retry(
                 missing, missing_lines,
                 backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
                 usage_out=usage_out,
+                effort=effort, execution_profile=execution_profile,
+                run_context=run_context, process_runner=process_runner,
+                receipt_sink=receipt_sink,
             )
             return parsed | recovered
         mid = len(missing) // 2
@@ -4469,11 +4472,17 @@ def _label_batch_with_retry(
             missing[:mid], missing_lines[:mid],
             backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
             usage_out=usage_out,
+            effort=effort, execution_profile=execution_profile,
+            run_context=run_context, process_runner=process_runner,
+            receipt_sink=receipt_sink,
         )
         right = _label_batch_with_retry(
             missing[mid:], missing_lines[mid:],
             backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
             usage_out=usage_out,
+            effort=effort, execution_profile=execution_profile,
+            run_context=run_context, process_runner=process_runner,
+            receipt_sink=receipt_sink,
         )
         return parsed | left | right
     except (json.JSONDecodeError, ValueError) as exc:
