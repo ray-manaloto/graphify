@@ -517,6 +517,56 @@ def test_posix_skill_root_treats_special_path_as_literal_data(tmp_path):
     assert payload["scan_root"] == str(source.resolve())
 
 
+@pytest.mark.parametrize("host", ["aider", "devin"])
+def test_monolith_skill_root_treats_special_path_as_literal_data(tmp_path, host):
+    source = tmp_path / "source ' $(touch SHOULD_NOT_RUN) ; `touch ALSO_NOT_RUN` $VAR"
+    source.mkdir()
+    (source / "sample.py").write_text("def answer(): return 42\n")
+    core, _ = _platform_artifacts(host)
+    assignment = next(
+        line for line in core.splitlines() if line.startswith("GRAPHIFY_INPUT_PATH=")
+    )
+    writer = next(
+        line for line in core.splitlines()
+        if line.startswith('"$PYTHON" -c ') and ".graphify_root" in line
+    )
+    script = "\n".join([
+        f"PYTHON={shlex.quote(sys.executable)}",
+        "mkdir -p graphify-out",
+        assignment.replace("INPUT_PATH_SHELL_LITERAL", shlex.quote(str(source))),
+        writer,
+    ])
+    completed = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+        timeout=10, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "graphify-out/.graphify_root").read_text() == str(source.resolve())
+    assert not (tmp_path / "SHOULD_NOT_RUN").exists()
+    assert not (tmp_path / "ALSO_NOT_RUN").exists()
+    assert "Path('INPUT_PATH')" not in core
+    assert "graphify.watch INPUT_PATH" not in core
+
+    (tmp_path / "graphify-out/.graphify_python").write_text(sys.executable)
+    step_two = core.split("### Step 2 - Detect files", 1)[1]
+    step_two = step_two.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    detected = subprocess.run(
+        ["bash", "-c", step_two], cwd=tmp_path, capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)}, timeout=10, check=False,
+    )
+    assert detected.returncode == 0, detected.stderr
+    sidecar = tmp_path / (".graphify_detect.json" if host == "aider" else "graphify-out/.graphify_detect.json")
+    assert json.loads(sidecar.read_text())["scan_root"] == str(source.resolve())
+
+
+def test_windows_skill_root_uses_encoded_literal_path():
+    core, _ = _platform_artifacts("windows")
+    assert "INPUT_PATH_POWERSHELL_LITERAL" in core
+    assert "$GRAPHIFY_INPUT_PATH = INPUT_PATH_POWERSHELL_LITERAL" in core
+    assert "Resolve-Path -LiteralPath $GRAPHIFY_INPUT_PATH -ErrorAction Stop" in core
+    assert "Resolve-Path INPUT_PATH" not in core
+
+
 def test_schema_singleton_passes_across_all_platforms():
     """The file_type enum is the six-value superset in every rendered artifact."""
     platforms = gen.load_platforms()
@@ -643,6 +693,15 @@ def test_monolith_roundtrip_passes_for_aider_and_devin():
     for key in ("aider", "devin"):
         problems = gen.monolith_roundtrip(platforms[key])
         assert problems == [], f"[{key}]\n" + "\n".join(problems)
+
+
+def test_monolith_literal_root_allowlist_rejects_unrelated_drift():
+    assert gen._is_monolith_literal_root_fix_line(
+        "GRAPHIFY_INPUT_PATH=INPUT_PATH_SHELL_LITERAL"
+    )
+    assert not gen._is_sanctioned_monolith_diff(
+        "rm -rf graphify-out unrelated-new-monolith-step"
+    )
 
 
 def test_monoliths_change_only_sanctioned_lines():

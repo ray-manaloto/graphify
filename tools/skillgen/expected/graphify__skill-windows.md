@@ -64,6 +64,8 @@ Only when the path is one or more `https://github.com/...` URLs, or several loca
 
 ### Step 1 - Ensure graphify is installed
 
+Before running this block, replace `INPUT_PATH_POWERSHELL_LITERAL` with the source path as one single-quoted PowerShell string; double any embedded apostrophe (`'` becomes `''`). Keep the quotes, and use `'.'` when no path was supplied.
+
 ```powershell
 # Detect Python with graphify — uv/pipx-aware (fixes #831)
 New-Item -ItemType Directory -Force -Path graphify-out | Out-Null
@@ -124,7 +126,9 @@ if (-not $GRAPHIFY_PYTHON) {
 $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 [System.IO.File]::WriteAllText((Join-Path $PWD 'graphify-out\.graphify_python'), [string]$GRAPHIFY_PYTHON, $Utf8NoBom)
 # Save scan root so `graphify update` (no args) knows where to look next time
-[System.IO.File]::WriteAllText((Join-Path $PWD 'graphify-out\.graphify_root'), (Resolve-Path INPUT_PATH).Path, $Utf8NoBom)
+$GRAPHIFY_INPUT_PATH = INPUT_PATH_POWERSHELL_LITERAL
+$GRAPHIFY_RESOLVED_ROOT = (Resolve-Path -LiteralPath $GRAPHIFY_INPUT_PATH -ErrorAction Stop).ProviderPath
+[System.IO.File]::WriteAllText((Join-Path $PWD 'graphify-out\.graphify_root'), $GRAPHIFY_RESOLVED_ROOT, $Utf8NoBom)
 ```
 
 If the import succeeds, print nothing and move straight to Step 2.

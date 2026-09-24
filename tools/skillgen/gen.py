@@ -1142,6 +1142,32 @@ def _is_community_label_export_fix_line(line: str) -> bool:
     )
 
 
+_MONOLITH_ROOT_READ = "open('graphify-out/.graphify_root', encoding='utf-8').read()"
+_MONOLITH_LITERAL_ROOT_LINES = {
+    "Before Step 1, replace `INPUT_PATH_SHELL_LITERAL` with the source path encoded as one POSIX shell word (for example, Python's `shlex.quote(path)`). Keep its quotes; use `.` when no path was supplied.",
+    "GRAPHIFY_INPUT_PATH=INPUT_PATH_SHELL_LITERAL",
+    '"$PYTHON" -c \'import pathlib, sys; pathlib.Path("graphify-out/.graphify_root").write_text(str(pathlib.Path(sys.argv[1]).resolve(strict=True)), encoding="utf-8")\' "$GRAPHIFY_INPUT_PATH"',
+    "result = detect(Path('INPUT_PATH'))",
+    f"result = detect(Path({_MONOLITH_ROOT_READ}))",
+    "result = detect_incremental(Path('INPUT_PATH'))",
+    f"result = detect_incremental(Path({_MONOLITH_ROOT_READ}))",
+    "report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, 'INPUT_PATH', suggested_questions=questions)",
+    f"report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, {_MONOLITH_ROOT_READ}, suggested_questions=questions)",
+    "report = generate(G, communities, cohesion, labels, analysis['gods'], analysis['surprises'], detection, tokens, 'INPUT_PATH', suggested_questions=questions)",
+    f"report = generate(G, communities, cohesion, labels, analysis['gods'], analysis['surprises'], detection, tokens, {_MONOLITH_ROOT_READ}, suggested_questions=questions)",
+    "python3 -m graphify.watch INPUT_PATH --debounce 3",
+    'python3 -m graphify.watch "$(cat graphify-out/.graphify_root)" --debounce 3',
+    "Replace INPUT_PATH with the actual path the user provided. Do NOT cat or print the JSON - read it silently and present a clean summary instead:",
+    "Replace INPUT_PATH with the actual path.",
+    "Replace INPUT_PATH with the folder to watch. Behavior depends on what changed:",
+}
+
+
+def _is_monolith_literal_root_fix_line(line: str) -> bool:
+    """Allow only the explicit old/new lines for monolith path-as-data repair."""
+    return line in _MONOLITH_LITERAL_ROOT_LINES
+
+
 # Every line that may differ between a rendered monolith and its pristine v8
 # baseline. Each predicate documents one sanctioned change-class; a blank line is
 # allowed because the multi-line fix blocks insert spacing. Anything else failing
@@ -1163,6 +1189,7 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_uv_from_interpreter_fix_line,
     _is_semantic_cache_scope_fix_line,
     _is_community_label_export_fix_line,
+    _is_monolith_literal_root_fix_line,
 )
 
 

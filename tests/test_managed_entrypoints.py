@@ -168,6 +168,32 @@ def test_managed_label_partial_batch_propagates_and_retains_attempt(monkeypatch,
     assert usage["output_tokens_known"] is False
 
 
+def test_managed_failed_batch_keeps_names_from_other_successful_batch(monkeypatch, tmp_path):
+    import networkx as nx
+
+    graph = nx.Graph()
+    communities = {0: ["a"], 1: ["b"], 2: ["c"]}
+    for name in ("a", "b", "c"):
+        graph.add_node(name, label=name)
+
+    def label_batch(cids, *_args, **_kwargs):
+        if cids == [0, 1]:
+            error = RuntimeError("first batch incomplete")
+            error.graphify_partial_labels = {0: "Named zero"}
+            raise error
+        return {2: "Named two"}
+
+    monkeypatch.setattr(llm, "_label_batch_with_retry", label_batch)
+    with pytest.raises(RuntimeError, match="first batch incomplete") as caught:
+        llm.label_communities(
+            graph, communities, backend="openai-cli", batch_size=2,
+            max_concurrency=1, run_context=_context(tmp_path),
+            process_runner=object(), receipt_sink=object(),
+        )
+
+    assert caught.value.graphify_partial_labels == {0: "Named zero", 2: "Named two"}
+
+
 def test_managed_label_two_batch_failure_retains_both_sink_receipts(tmp_path):
     import networkx as nx
 
