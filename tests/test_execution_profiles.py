@@ -62,6 +62,51 @@ def _context(tmp_path: Path, *, capture_required: bool = True) -> dict:
     }
 
 
+def test_public_deep_prompt_admits_matching_managed_checkpoint(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    doc = corpus / "source.md"
+    doc.write_text("# Source\nA concrete decision and rationale.\n")
+    output = tmp_path / "output"
+    profile = _profile()
+    context = _context(tmp_path)
+    prompt = llm.extraction_system_prompt(deep=True)
+    receipt = {"receipt_id": "original-producer", "completion": "completed"}
+    assert cache.save_semantic_cache(
+        [{"id": "decision", "label": "Decision", "source_file": str(doc)}],
+        [],
+        root=corpus,
+        cache_root=output,
+        mode="deep",
+        prompt=prompt,
+        execution_profile=profile,
+        run_context=context,
+        producer_receipt=receipt,
+    ) == 1
+    evidence: list[dict] = []
+    nodes, _, _, uncached = cache.check_semantic_cache(
+        [str(doc)],
+        root=corpus,
+        cache_root=output,
+        mode="deep",
+        prompt=llm.extraction_system_prompt(deep=True),
+        execution_profile=profile,
+        run_context=context,
+        cache_evidence_out=evidence,
+    )
+    assert not uncached and len(nodes) == 1
+    assert evidence[0]["producer_receipts"] == [receipt]
+    assert cache.check_semantic_cache(
+        [str(doc)],
+        root=corpus,
+        cache_root=output,
+        mode="deep",
+        prompt=llm.extraction_system_prompt(deep=False),
+        execution_profile=profile,
+        run_context=context,
+    )[-1] == [str(doc)]
+
+
 def _invocation(tmp_path: Path, profile: dict | None = None) -> dict:
     selected = execution.resolve_execution_profile(
         None,
