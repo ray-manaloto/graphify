@@ -20,6 +20,8 @@ from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 from graphify.paths import os_replace_with_fallback as _os_replace_with_fallback
 from graphify.raster import is_supported_raster_path
 from graphify.execution import (
+    MANAGED_CLAUDE_DEEP_ARGS,
+    MANAGED_CLAUDE_EXTRACT_POLICY_VERSION,
     execution_profile_fingerprint,
     resolve_execution_profile,
     validate_effective_managed_mode,
@@ -1282,6 +1284,7 @@ def _semantic_compatibility_fingerprint(
         if context is None:
             raise ValueError("managed semantic cache requires run_context")
         profile_fingerprint = None
+        profile = None
         if execution_profile is not None:
             profile = resolve_execution_profile(
                 None, None, None, execution_profile=execution_profile, purpose="extract"
@@ -1296,6 +1299,12 @@ def _semantic_compatibility_fingerprint(
             "configuration_identity": context["configuration_identity"],
             "instruction_identity": context["instruction_identity"],
         }
+        if profile is not None and profile["backend"] == "claude-cli":
+            payload["managed_claude_extract_policy"] = {
+                "version": MANAGED_CLAUDE_EXTRACT_POLICY_VERSION,
+                "terminal_result_required": True,
+                "argv": list(MANAGED_CLAUDE_DEEP_ARGS) if mode == "deep" else [],
+            }
         base_fingerprint = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
