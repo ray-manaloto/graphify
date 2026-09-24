@@ -245,6 +245,18 @@ def test_builders_fall_back_to_string_without_pixels(tmp_path):
     assert isinstance(oc, str) and "sub/diagram.png" in oc
 
 
+def test_codex_path_attachment_is_not_described_as_unseen(tmp_path):
+    img, _, _ = _make_corpus(tmp_path)
+    refs = llm._build_image_refs([img], tmp_path, read_bytes=False)
+
+    attached = llm._with_image_notes("CORPUS", refs, attached_by_path=True)
+    unattached = llm._with_image_notes("CORPUS", refs)
+
+    assert "sub/diagram.png" in attached
+    assert "not shown" not in attached
+    assert "not shown" in unattached
+
+
 def test_no_images_is_byte_identical(tmp_path):
     # With no image refs, the user content must be exactly the text blob.
     assert llm._anthropic_content("PLAIN", []) == "PLAIN"
