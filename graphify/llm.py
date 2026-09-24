@@ -4526,6 +4526,12 @@ def _label_batch_with_retry(
             raise
         return retained
     except (json.JSONDecodeError, ValueError) as exc:
+        # A recursive retry may raise its own parse error after an earlier
+        # response supplied valid labels. Its partial map was attached by the
+        # inner handler; do not mistake it for a parse failure of this batch and
+        # resend already completed community IDs.
+        if "graphify_partial_labels" in exc.__dict__:
+            raise
         # Parse failure. If we can still split, retry each half on a smaller
         # prompt (smaller output → less likely to truncate/mangle). At the base
         # case (single community or max depth) re-raise so the caller skips it.
@@ -4719,7 +4725,20 @@ def label_communities(
         # lowest-index error for caller-owned failure evidence.
         error = errors[min(errors)]
         if effective_managed:
-            error.__dict__.setdefault("graphify_partial_labels", dict(labels))
+            # An existing partial map contains observed model names, not the
+            # fallback Community N placeholders. Add names from other batches
+            # without weakening that distinction. With no partial map, retain
+            # the legacy complete-state evidence including placeholders.
+            partial = getattr(error, "graphify_partial_labels", None)
+            if isinstance(partial, dict):
+                merged = dict(partial)
+                merged.update({
+                    cid: name for cid, name in labels.items()
+                    if name != f"Community {cid}"
+                })
+                error.__dict__["graphify_partial_labels"] = merged
+            else:
+                error.__dict__["graphify_partial_labels"] = dict(labels)
         raise error
     return labels
 

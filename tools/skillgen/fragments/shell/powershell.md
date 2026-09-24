@@ -1,3 +1,5 @@
+Before running this block, replace `INPUT_PATH` inside the single-quoted here-string with the exact source path. Use `.` when no path was supplied. Keep the here-string delimiters intact so PowerShell metacharacters remain literal data.
+
 ```powershell
 # Detect Python with graphify — uv/pipx-aware (fixes #831)
 New-Item -ItemType Directory -Force -Path graphify-out | Out-Null
@@ -65,7 +67,8 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $InputPathRaw = @'
 INPUT_PATH
 '@
-[System.IO.File]::WriteAllText((Join-Path $PWD 'graphify-out\.graphify_root'), (Resolve-Path $InputPathRaw.Trim()).Path, $Utf8NoBom)
+[string]$GRAPHIFY_RESOLVED_ROOT = (Resolve-Path -LiteralPath $InputPathRaw -ErrorAction Stop).ProviderPath
+[System.IO.File]::WriteAllText((Join-Path $PWD 'graphify-out\.graphify_root'), $GRAPHIFY_RESOLVED_ROOT, $Utf8NoBom)
 ```
 
 If the import succeeds, print nothing and move straight to Step 2.
