@@ -8,6 +8,10 @@ lives only in the references, and no reference duplicates core content.
 """
 from __future__ import annotations
 
+import json
+import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -467,6 +471,50 @@ def test_posix_hosts_keep_their_bash_invocations():
     assert "```bash" in claude_core
     assert gen._PY_INVOKE_POSIX in claude_core
     assert "'@ | & (Get-Content" not in claude_core
+
+
+def test_posix_skill_root_treats_special_path_as_literal_data(tmp_path):
+    source = tmp_path / "source ' $(touch SHOULD_NOT_RUN) ; `touch ALSO_NOT_RUN` $VAR"
+    source.mkdir()
+    (source / "sample.py").write_text("def answer(): return 42\n")
+    fragment = (gen.FRAGMENTS_DIR / "shell/posix.md").read_text()
+    assignment = next(
+        line for line in fragment.splitlines() if line.startswith("GRAPHIFY_INPUT_PATH=")
+    )
+    writer = next(
+        line for line in fragment.splitlines() if line.startswith('"$PYTHON" -c ')
+        and ".graphify_root" in line
+    )
+    script = "\n".join([
+        f"PYTHON={shlex.quote(sys.executable)}",
+        "mkdir -p graphify-out",
+        assignment.replace("INPUT_PATH_SHELL_LITERAL", shlex.quote(str(source))),
+        writer,
+    ])
+    completed = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+        timeout=10, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "graphify-out/.graphify_root").read_text() == str(source.resolve())
+    assert not (tmp_path / "SHOULD_NOT_RUN").exists()
+    assert not (tmp_path / "ALSO_NOT_RUN").exists()
+    core, refs = _claude_artifacts()
+    assert "'INPUT_PATH'" not in core
+    assert "'INPUT_PATH'" not in refs["update.md"]
+    assert "graphify.watch INPUT_PATH" not in refs["add-watch.md"]
+
+    (tmp_path / "graphify-out/.graphify_python").write_text(sys.executable)
+    step_two = core.split("### Step 2 - Detect files", 1)[1]
+    step_two = step_two.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    detected = subprocess.run(
+        ["bash", "-c", step_two], cwd=tmp_path, capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)}, timeout=10, check=False,
+    )
+    assert detected.returncode == 0, detected.stderr
+    payload = json.loads((tmp_path / "graphify-out/.graphify_detect.json").read_text())
+    assert payload["scan_root"] == str(source.resolve())
 
 
 def test_schema_singleton_passes_across_all_platforms():

@@ -41,10 +41,10 @@ Supported URL types (auto-detected):
 Start a background watcher that monitors a folder and auto-updates the graph when files change.
 
 ```bash
-$(cat graphify-out/.graphify_python) -m graphify.watch INPUT_PATH --debounce 3
+$(cat graphify-out/.graphify_python) -m graphify.watch "$(cat graphify-out/.graphify_root)" --debounce 3
 ```
 
-Replace INPUT_PATH with the folder to watch. Behavior depends on what changed:
+The quoted path comes from the root saved in Step 1. Behavior depends on what changed:
 
 - **Code files only (.py, .ts, .go, etc.):** re-runs AST extraction + rebuild + cluster immediately, no LLM needed. `graph.json` and `GRAPH_REPORT.md` are updated automatically.
 - **Docs, papers, or images:** writes a `graphify-out/needs_update` flag and prints a notification to run `/graphify --update` (LLM semantic re-extraction required).

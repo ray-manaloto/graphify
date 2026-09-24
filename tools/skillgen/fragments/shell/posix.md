@@ -1,6 +1,9 @@
+Before running this block, replace `INPUT_PATH_SHELL_LITERAL` with the exact source path encoded as one POSIX shell word (for example, Python's `shlex.quote(path)`). Keep the resulting quotes; never paste the raw path into shell code. Use `.` when no path was supplied.
+
 ```bash
 # Detect the correct Python interpreter (handles uv tool, pipx, venv, system installs)
 PYTHON=""
+GRAPHIFY_INPUT_PATH=INPUT_PATH_SHELL_LITERAL
 GRAPHIFY_BIN=$(which graphify 2>/dev/null)
 # 1. uv tool installs — most reliable on modern Mac/Linux
 if [ -z "$PYTHON" ] && command -v uv >/dev/null 2>&1; then
@@ -31,7 +34,7 @@ fi
 mkdir -p graphify-out
 "$PYTHON" -c "import sys; open('graphify-out/.graphify_python', 'w', encoding='utf-8').write(sys.executable)"
 # Save scan root so `graphify update` (no args) knows where to look next time
-echo "$(cd INPUT_PATH && pwd)" > graphify-out/.graphify_root
+"$PYTHON" -c 'import pathlib, sys; pathlib.Path("graphify-out/.graphify_root").write_text(str(pathlib.Path(sys.argv[1]).resolve(strict=True)), encoding="utf-8")' "$GRAPHIFY_INPUT_PATH"
 ```
 
 If the import succeeds, print nothing and move straight to Step 2.
