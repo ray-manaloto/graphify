@@ -1003,6 +1003,11 @@ def _preflight_raster_cache_admission(files: Sequence[Path | FileSlice], *, root
     return {"preflight_batches": batches, "attachment_compatibility": compatibility}
 
 
+def preflight_raster_cache_admission(files: Sequence[Path | FileSlice], *, root: Path) -> dict:
+    """Validate raster inputs and return their cache compatibility fingerprints."""
+    return _preflight_raster_cache_admission(files, root=root)
+
+
 def _split_chunks_by_raster_limit(
     chunks: Sequence[Sequence[Path | FileSlice]],
 ) -> list[list[Path | FileSlice]]:
