@@ -70,7 +70,7 @@ $(cat graphify-out/.graphify_python) -c "
 import json
 from graphify.detect import detect
 from pathlib import Path
-result = detect(Path('INPUT_PATH'))
+result = detect(Path(Path('graphify-out/.graphify_root').read_text(encoding='utf-8')))
 # Write the sidecar from Python, not a shell redirect, so the same block renders
 # on PowerShell hosts without console-encoding drift (#2528).
 Path('graphify-out/.graphify_detect.json').write_text(json.dumps(result, ensure_ascii=False), encoding=\"utf-8\")
@@ -78,7 +78,7 @@ print(f'Detected {result[\"total_files\"]} files')
 "
 ```
 
-Replace INPUT_PATH with the actual path the user provided. Do NOT cat or print the JSON - read it silently and present a clean summary instead:
+Step 1 saved the resolved source path in `graphify-out/.graphify_root`; later Python blocks read that file as data. Do NOT paste the raw path into code. Do NOT cat or print the detect JSON - read it silently and present a clean summary instead:
 
 ```
 Corpus: X files · ~Y words
@@ -95,7 +95,7 @@ Then act on it:
 - If `total_files` is 0: stop with "No supported files found in [path]."
 - If `skipped_sensitive` is non-empty: report the count and list the skipped file names, so a wrongly-flagged source or doc is visible and can be renamed or moved (#2106).
 - If `total_words` > 2,000,000 OR `total_files` > 500: show the warning. Then compute the top 5 first-level subdirectories by file count:
-  - Read `scan_root` from the detect JSON (always an absolute path to the resolved INPUT_PATH).
+  - Read `scan_root` from the detect JSON (always an absolute path to the resolved source root).
   - Concatenate all file lists across all types (`code`, `document`, `paper`, `image`, `video`).
   - Filter out any path that starts with `scan_root + "/graphify-out/"` to exclude converted sidecars.
   - For each file, strip the `scan_root` prefix and take the first path component. Files directly in `scan_root` with no subdirectory count as `(root)`.
@@ -143,7 +143,7 @@ for f in detect.get('files', {}).get('code', []):
     code_files.extend(collect_files(Path(f)) if Path(f).is_dir() else [Path(f)])
 
 if code_files:
-    result = extract(code_files, cache_root=Path('INPUT_PATH'))
+    result = extract(code_files, cache_root=Path(Path('graphify-out/.graphify_root').read_text(encoding='utf-8')))
     Path('graphify-out/.graphify_ast.json').write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding=\"utf-8\")
     print(f'AST: {len(result[\"nodes\"])} nodes, {len(result[\"edges\"])} edges')
 else:
@@ -190,7 +190,7 @@ detect = json.loads(Path('graphify-out/.graphify_detect.json').read_text(encodin
 # every source file (#1392). Video is transcribed to a document in Step 2.5 first.
 all_files = [f for cat in ('document', 'paper', 'image') for f in detect['files'].get(cat, [])]
 
-cached_nodes, cached_edges, cached_hyperedges, uncached = check_semantic_cache(all_files, root='INPUT_PATH', prompt_file='SPEC_PATH')
+cached_nodes, cached_edges, cached_hyperedges, uncached = check_semantic_cache(all_files, root=Path('graphify-out/.graphify_root').read_text(encoding='utf-8'), prompt_file='SPEC_PATH')
 
 # Always (re)write the cache file: write hits, else DELETE any leftover from a prior
 # run so Part C never merges a stale .graphify_cached.json (#1392).
@@ -254,7 +254,7 @@ from pathlib import Path
 
 new = json.loads(Path('graphify-out/.graphify_semantic_new.json').read_text(encoding=\"utf-8\")) if Path('graphify-out/.graphify_semantic_new.json').exists() else {'nodes':[],'edges':[],'hyperedges':[]}
 uncached = [line for line in Path('graphify-out/.graphify_uncached.txt').read_text(encoding=\"utf-8\").splitlines() if line]
-saved = save_semantic_cache(new.get('nodes', []), new.get('edges', []), new.get('hyperedges', []), root='INPUT_PATH', allowed_source_files=uncached, prompt_file='SPEC_PATH')
+saved = save_semantic_cache(new.get('nodes', []), new.get('edges', []), new.get('hyperedges', []), root=Path('graphify-out/.graphify_root').read_text(encoding='utf-8'), allowed_source_files=uncached, prompt_file='SPEC_PATH')
 print(f'Cached {saved} files')
 "
 ```
@@ -327,7 +327,7 @@ print(f'Merged: {total} nodes, {edges} edges ({len(ast[\"nodes\"])} AST + {len(s
 
 ### Step 4 - Build graph, cluster, analyze, generate outputs
 
-**Before starting:** the code blocks below pass `directed=IS_DIRECTED` to `build_from_json()`. Replace `IS_DIRECTED` with `True` if `--directed` was given (builds a `DiGraph` preserving edge direction source→target), otherwise `False` (the default undirected `Graph`). Substitute it the same way you substitute `INPUT_PATH` — do not leave the literal `IS_DIRECTED` in the code.
+**Before starting:** the code blocks below pass `directed=IS_DIRECTED` to `build_from_json()`. Replace `IS_DIRECTED` with `True` if `--directed` was given (builds a `DiGraph` preserving edge direction source→target), otherwise `False` (the default undirected `Graph`). The source path comes from `.graphify_root`; do not leave the literal `IS_DIRECTED` in the code.
 
 ```bash
 mkdir -p graphify-out
@@ -345,7 +345,7 @@ detection  = json.loads(Path('graphify-out/.graphify_detect.json').read_text(enc
 
 # root= mirrors the --update runbook (#1361): relativize source_file to the same
 # base so the full build and incremental --update never drift apart on re-extract.
-G = build_from_json(extraction, root='INPUT_PATH', directed=IS_DIRECTED)
+G = build_from_json(extraction, root=Path('graphify-out/.graphify_root').read_text(encoding='utf-8'), directed=IS_DIRECTED)
 # Guard BEFORE any write: an empty extraction must not clobber a good graph.json /
 # GRAPH_REPORT.md / analysis sidecar. Check immediately after build (#1392).
 if G.number_of_nodes() == 0:
@@ -370,7 +370,7 @@ if not wrote:
     print('ERROR: refused to shrink graphify-out/graph.json (existing graph has more nodes; #479).')
     print('If this shrink is intentional (you deleted files), re-run a full build with --force.')
     raise SystemExit(1)
-report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, 'INPUT_PATH', suggested_questions=questions)
+report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, Path('graphify-out/.graphify_root').read_text(encoding='utf-8'), suggested_questions=questions)
 Path('graphify-out/GRAPH_REPORT.md').write_text(report, encoding=\"utf-8\")
 analysis = {
     'communities': {str(k): v for k, v in communities.items()},
@@ -386,7 +386,7 @@ print(f'Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges, {len(co
 
 If this step prints `ERROR: Graph is empty`, stop and tell the user what happened - do not proceed to labeling or visualization.
 
-Replace INPUT_PATH with the actual path.
+The source path is read from `graphify-out/.graphify_root`; do not paste it into this block.
 
 ### Step 4.5 - Graph health check (read-only integrity gate)
 
@@ -399,7 +399,7 @@ from pathlib import Path
 from graphify.diagnostics import diagnose_extraction, format_diagnostic_report
 
 extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding=\"utf-8\"))
-summary = diagnose_extraction(extraction, directed=IS_DIRECTED, root='INPUT_PATH')
+summary = diagnose_extraction(extraction, directed=IS_DIRECTED, root=Path('graphify-out/.graphify_root').read_text(encoding='utf-8'))
 print(format_diagnostic_report(summary))
 flags = [f'{summary[k]} {label}' for k, label in (
     ('dangling_endpoint_edges', 'dangling-endpoint edges'),
@@ -412,7 +412,7 @@ print('GRAPH HEALTH WARNING: ' + '; '.join(flags) + ' - graph may be incomplete/
 "
 ```
 
-Substitute `IS_DIRECTED` and `INPUT_PATH` as in Step 4. If a `GRAPH HEALTH WARNING` prints, surface it in the final summary (do not abort — the graph is still usable, but the integrity issue must be visible, per the Honesty Rules).
+Substitute `IS_DIRECTED` as in Step 4; read the source path from `.graphify_root`. If a `GRAPH HEALTH WARNING` prints, surface it in the final summary (do not abort — the graph is still usable, but the integrity issue must be visible, per the Honesty Rules).
 
 ### Step 5 - Label communities
 
@@ -435,7 +435,7 @@ detection  = json.loads(Path('graphify-out/.graphify_detect.json').read_text(enc
 analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text(encoding=\"utf-8\"))
 
 # root= as in Step 4 / the --update runbook (#1361) — same base for node-key parity.
-G = build_from_json(extraction, root='INPUT_PATH', directed=IS_DIRECTED)
+G = build_from_json(extraction, root=Path('graphify-out/.graphify_root').read_text(encoding='utf-8'), directed=IS_DIRECTED)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 cohesion = {int(k): v for k, v in analysis['cohesion'].items()}
 tokens = {'input': extraction.get('input_tokens', 0), 'output': extraction.get('output_tokens', 0)}
@@ -446,7 +446,7 @@ labels = LABELS_DICT
 # Regenerate questions with real community labels (labels affect question phrasing)
 questions = suggest_questions(G, communities, labels)
 
-report = generate(G, communities, cohesion, labels, analysis['gods'], analysis['surprises'], detection, tokens, 'INPUT_PATH', suggested_questions=questions)
+report = generate(G, communities, cohesion, labels, analysis['gods'], analysis['surprises'], detection, tokens, Path('graphify-out/.graphify_root').read_text(encoding='utf-8'), suggested_questions=questions)
 Path('graphify-out/GRAPH_REPORT.md').write_text(report, encoding=\"utf-8\")
 Path('graphify-out/.graphify_labels.json').write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding=\"utf-8\")
 # Re-export so graph.json nodes carry the curated community_name (#2490).
@@ -461,7 +461,7 @@ print('Report updated with community labels')
 ```
 
 Replace `LABELS_DICT` with the actual dict you constructed (e.g. `{0: "Attention Mechanism", 1: "Training Pipeline"}`).
-Replace INPUT_PATH with the actual path.
+The source path is read from `graphify-out/.graphify_root`; do not paste it into this block.
 
 ### Step 6 - Generate Obsidian vault (opt-in) + HTML
 
@@ -516,7 +516,7 @@ extract = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encod
 # types are gated on output.
 from graphify.cli import _stamped_manifest_files
 _corpus = detect.get('all_files') or detect['files']
-_manifest_files = _stamped_manifest_files(_corpus, extract, Path('INPUT_PATH'))
+_manifest_files = _stamped_manifest_files(_corpus, extract, Path(Path('graphify-out/.graphify_root').read_text(encoding='utf-8')))
 # Files dispatched this run (the changed subset) but NOT stamped above still carry
 # a stale semantic_hash from a prior run; clear it so detect_incremental re-queues
 # them instead of reading them as unchanged (#1948).
@@ -528,7 +528,7 @@ _cleared = _dispatched - _stamped
 # files newly excluded since last run are dropped rather than masquerading as
 # deletions; untouched files' prior rows are still preserved (#1908).
 _scan = {f for fl in _corpus.values() for f in fl}
-save_manifest(_manifest_files, root='INPUT_PATH', scan_corpus=_scan, clear_semantic=_cleared or None)
+save_manifest(_manifest_files, root=Path('graphify-out/.graphify_root').read_text(encoding='utf-8'), scan_corpus=_scan, clear_semantic=_cleared or None)
 
 # Update cumulative cost tracker
 input_tok = extract.get('input_tokens', 0)
@@ -558,7 +558,7 @@ find graphify-out -maxdepth 1 -name '.graphify_chunk_*.json' -delete 2>/dev/null
 rm -f graphify-out/.needs_update 2>/dev/null || true
 ```
 
-Replace INPUT_PATH with the actual path (same value used in Steps 4-5) so the manifest is relativized to the scan root.
+The manifest uses the saved source path from `graphify-out/.graphify_root`, the same value used in Steps 4-5, so its paths are relativized to the scan root.
 
 Tell the user (omit the obsidian line unless --obsidian was given):
 ```

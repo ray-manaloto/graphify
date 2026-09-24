@@ -1,3 +1,5 @@
+Before running this block, replace `INPUT_PATH` inside the quoted heredoc with the exact source path. Use `.` when no path was supplied. Keep the heredoc delimiter quoted so shell metacharacters in the path remain literal data.
+
 ```bash
 # Detect the correct Python interpreter (handles uv tool, pipx, venv, system installs)
 PYTHON=""
