@@ -107,6 +107,57 @@ def test_public_deep_prompt_admits_matching_managed_checkpoint(tmp_path: Path) -
     )[-1] == [str(doc)]
 
 
+def test_public_raster_admission_keys_managed_deep_cache(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    image = corpus / "alpha.png"
+    shutil.copyfile(Path(__file__).parent / "fixtures" / "raster" / "alpha.png", image)
+    admission = llm.preflight_raster_cache_admission([image], root=corpus)
+    compatibility = admission["attachment_compatibility"]
+    assert len(admission["preflight_batches"]) == len(compatibility) == 1
+    profile = _profile()
+    context = _context(tmp_path)
+    receipt = {"receipt_id": "image-producer", "completion": "completed"}
+    assert cache.save_semantic_cache(
+        [{"id": "pixel", "label": "Concept", "source_file": str(image)}],
+        [],
+        root=corpus,
+        cache_root=tmp_path / "output",
+        mode="deep",
+        prompt=llm.extraction_system_prompt(deep=True),
+        execution_profile=profile,
+        run_context=context,
+        producer_receipt=receipt,
+        attachment_compatibility=compatibility,
+    ) == 1
+    evidence: list[dict] = []
+    nodes, _, _, uncached = cache.check_semantic_cache(
+        [str(image)],
+        root=corpus,
+        cache_root=tmp_path / "output",
+        mode="deep",
+        prompt=llm.extraction_system_prompt(deep=True),
+        execution_profile=profile,
+        run_context=context,
+        cache_evidence_out=evidence,
+        attachment_compatibility=llm.preflight_raster_cache_admission(
+            [image], root=corpus
+        )["attachment_compatibility"],
+    )
+    assert [node["id"] for node in nodes] == ["pixel"] and not uncached
+    assert evidence[0]["producer_receipts"] == [receipt]
+    assert cache.check_semantic_cache(
+        [str(image)],
+        root=corpus,
+        cache_root=tmp_path / "output",
+        mode="deep",
+        prompt=llm.extraction_system_prompt(deep=True),
+        execution_profile=profile,
+        run_context=context,
+        attachment_compatibility={},
+    )[-1] == [str(image)]
+
+
 def _invocation(tmp_path: Path, profile: dict | None = None) -> dict:
     selected = execution.resolve_execution_profile(
         None,
