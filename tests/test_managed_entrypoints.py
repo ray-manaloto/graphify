@@ -115,7 +115,13 @@ def test_capture_required_text_cli_retains_receipt(monkeypatch, tmp_path):
         )
         == "answer"
     )
-    assert usage == {"input": 2, "output": 3, "_execution_receipts": [receipt]}
+    assert usage == {
+        "input": 2,
+        "output": 3,
+        "input_tokens_known": False,
+        "output_tokens_known": False,
+        "_execution_receipts": [receipt],
+    }
 
 
 def test_managed_label_partial_batch_propagates_and_retains_attempt(monkeypatch, tmp_path):
@@ -126,7 +132,11 @@ def test_managed_label_partial_batch_propagates_and_retains_attempt(monkeypatch,
     graph.add_node("b", label="Beta")
     communities = {0: ["a"], 1: ["b"]}
     calls = 0
-    failed_receipt = {"receipt_id": "label-failed", "completion": "incomplete_capture"}
+    failed_receipt = {
+        "receipt_id": "label-failed",
+        "completion": "incomplete_capture",
+        "usage": {"input_tokens_known": False, "output_tokens_known": False},
+    }
 
     def label_batch(cids, *_args, **_kwargs):
         nonlocal calls
@@ -154,6 +164,8 @@ def test_managed_label_partial_batch_propagates_and_retains_attempt(monkeypatch,
     assert caught.value.graphify_partial_labels[0] == "Named zero"
     assert caught.value.graphify_partial_labels[1] == "Community 1"
     assert usage["_execution_receipts"] == [failed_receipt]
+    assert usage["input_tokens_known"] is False
+    assert usage["output_tokens_known"] is False
 
 
 def test_managed_label_two_batch_failure_retains_both_sink_receipts(tmp_path):
