@@ -876,9 +876,9 @@ def _reconcile_existing_graph(
         # extractor loss, or the sensitive-file heuristic still preserves, with
         # a loud message (#1795).
         excluded_alive_files: set[str] = set()
-        excluded_alive_nodes = 0
+        excluded_alive_nodes: set[int] = set()
         newly_ignored_files: set[str] = set()
-        newly_ignored_nodes = 0
+        newly_ignored_nodes: set[int] = set()
         _alive_cache: dict[str, bool] = {}
         _ignored_cache: dict[str, bool] = {}
 
@@ -901,73 +901,78 @@ def _reconcile_existing_graph(
                 )
                 _ignored_cache[identity] = ignored
             return ignored
-        for node in existing.get("nodes", []):
-            source_file = node.get("source_file")
-            if not source_file or _is_remote_source(source_file):
-                continue  # sourceless stub or remote/virtual source: never evict
-            identity = source_paths.identity(source_file)
-            if not source_paths.in_watch_root(source_file):
-                continue
-            if _get_extractor(Path(source_file)) is None:
-                # Non-AST source (semantic doc/paper/image — .txt/.pdf/.png/...):
-                # never present in current_sources (built from AST-extractable
-                # code_files), so corpus absence is meaningless. Deletion
-                # evidence here is disk absence — otherwise its semantic nodes
-                # are preserved forever and returned as authoritative even after
-                # the file is deleted (#2051) — or a live ignore rule matching
-                # the alive file (#2495), the same positive evidence the AST
-                # branch below requires. A present-but-unexcluded-but-
-                # unextractable file stays preserved (alive -> skip).
-                if identity:
-                    alive = _alive_cache.get(identity)
-                    if alive is None:
-                        alive = Path(identity).exists()
-                        _alive_cache[identity] = alive
-                    ignored = alive and _ignored_now(identity)
-                    if ignored:
-                        newly_ignored_files.add(identity)
-                        newly_ignored_nodes += 1
-                    if not alive or ignored:
-                        normalized = source_paths.normalize(source_file)
-                        if normalized:
-                            deleted_paths.add(normalized)
+        for node_index, node in enumerate(existing.get("nodes", [])):
+            seen_contributors: set[str] = set()
+            for contributor in source_path_records(node):
+                source_file = contributor.get("source_file")
+                if not source_file or _is_remote_source(source_file):
+                    continue  # sourceless stub or remote/virtual source: never evict
+                identity = source_paths.identity(source_file)
+                if not source_paths.in_watch_root(source_file):
+                    continue
+                if identity in seen_contributors:
+                    continue
+                seen_contributors.add(identity)
+                if _get_extractor(Path(source_file)) is None:
+                    # Non-AST source (semantic doc/paper/image — .txt/.pdf/.png/...):
+                    # never present in current_sources (built from AST-extractable
+                    # code_files), so corpus absence is meaningless. Deletion
+                    # evidence here is disk absence — otherwise its semantic nodes
+                    # are preserved forever and returned as authoritative even after
+                    # the file is deleted (#2051) — or a live ignore rule matching
+                    # the alive file (#2495), the same positive evidence the AST
+                    # branch below requires. A present-but-unexcluded-but-
+                    # unextractable file stays preserved (alive -> skip).
+                    if identity:
+                        alive = _alive_cache.get(identity)
+                        if alive is None:
+                            alive = Path(identity).exists()
+                            _alive_cache[identity] = alive
+                        ignored = alive and _ignored_now(identity)
+                        if ignored:
+                            newly_ignored_files.add(identity)
+                            newly_ignored_nodes.add(node_index)
+                        if not alive or ignored:
+                            normalized = source_paths.normalize(source_file)
+                            if normalized:
+                                deleted_paths.add(normalized)
+                            node_evicted_source_identities.add(identity)
+                            edge_evicted_source_identities.add(identity)
+                            hyperedge_evicted_source_identities.add(identity)
+                    continue
+                if identity not in current_sources:
+                    if identity:
+                        alive = _alive_cache.get(identity)
+                        if alive is None:
+                            alive = Path(identity).exists()
+                            _alive_cache[identity] = alive
+                        if alive:
+                            if _ignored_now(identity):
+                                # Intentionally excluded by a live ignore rule:
+                                # deliberate graph-level intent, so treat it exactly
+                                # like a deletion (#2495) — fall through to evict.
+                                newly_ignored_files.add(identity)
+                                newly_ignored_nodes.add(node_index)
+                            else:
+                                excluded_alive_files.add(identity)
+                                excluded_alive_nodes.add(node_index)
+                                continue
+                    normalized = source_paths.normalize(source_file)
+                    if normalized:
+                        deleted_paths.add(normalized)
+                    if identity:
                         node_evicted_source_identities.add(identity)
                         edge_evicted_source_identities.add(identity)
                         hyperedge_evicted_source_identities.add(identity)
-                continue
-            if identity not in current_sources:
-                if identity:
-                    alive = _alive_cache.get(identity)
-                    if alive is None:
-                        alive = Path(identity).exists()
-                        _alive_cache[identity] = alive
-                    if alive:
-                        if _ignored_now(identity):
-                            # Intentionally excluded by a live ignore rule:
-                            # deliberate graph-level intent, so treat it exactly
-                            # like a deletion (#2495) — fall through to evict.
-                            newly_ignored_files.add(identity)
-                            newly_ignored_nodes += 1
-                        else:
-                            excluded_alive_files.add(identity)
-                            excluded_alive_nodes += 1
-                            continue
-                normalized = source_paths.normalize(source_file)
-                if normalized:
-                    deleted_paths.add(normalized)
-                if identity:
-                    node_evicted_source_identities.add(identity)
-                    edge_evicted_source_identities.add(identity)
-                    hyperedge_evicted_source_identities.add(identity)
         if newly_ignored_files:
             print(
-                f"[graphify watch] pruned {newly_ignored_nodes} node(s) from "
+                f"[graphify watch] pruned {len(newly_ignored_nodes)} node(s) from "
                 f"{len(newly_ignored_files)} newly-ignored file(s) "
                 "(matched by a live ignore rule while absent from the scan corpus)."
             )
         if excluded_alive_files:
             print(
-                f"[graphify watch] fail-closed: kept {excluded_alive_nodes} node(s) "
+                f"[graphify watch] fail-closed: kept {len(excluded_alive_nodes)} node(s) "
                 f"from {len(excluded_alive_files)} file(s) that left the scan corpus "
                 "but still exist on disk and match no current ignore rule (filters "
                 "changed?). Add them to .graphifyignore if the exclusion is intentional."

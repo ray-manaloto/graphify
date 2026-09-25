@@ -1179,6 +1179,50 @@ def test_managed_openai_isolates_project_config_and_cleans_neutral_cwd(tmp_path)
     )
 
 
+def test_isolated_cli_refuses_project_cwd_before_runner(tmp_path):
+    profile = _profile()
+    profile["cli_policy"].update(
+        project_configuration="isolated", mcp="isolated-config"
+    )
+    with pytest.raises(ValueError, match="outside project_root"):
+        _invocation(tmp_path, profile)
+
+    neutral = tmp_path.parent / "neutral"
+    neutral.mkdir(exist_ok=True)
+    selected = execution.resolve_execution_profile(
+        None, None, None, execution_profile=profile,
+        purpose="extract", environment={},
+    )
+    invocation = execution.build_cli_invocation(
+        "extract this", purpose="extract", max_tokens=100,
+        profile=selected, output_path=tmp_path / "answer.json",
+        project_root=tmp_path, cwd=neutral,
+    )
+    invocation["cwd"] = str(tmp_path)
+    called = False
+
+    def runner(_request):
+        nonlocal called
+        called = True
+
+    with pytest.raises(ValueError, match="outside project_root"):
+        execution.run_cli_invocation(
+            invocation, run_context=_context(tmp_path),
+            process_runner=runner, receipt_sink=_ack([]),
+        )
+    assert not called
+
+    alias = tmp_path.parent / f"{tmp_path.name}-alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    invocation["cwd"] = str(alias)
+    with pytest.raises(ValueError, match="outside project_root"):
+        execution.run_cli_invocation(
+            invocation, run_context=_context(tmp_path),
+            process_runner=runner, receipt_sink=_ack([]),
+        )
+    assert not called
+
+
 def test_isolated_project_config_rejects_incomplete_policy(tmp_path):
     profile = _profile()
     profile["cli_policy"]["project_configuration"] = "isolated"

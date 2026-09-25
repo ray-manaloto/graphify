@@ -5,6 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 
 
+_SOURCE_BOUND_FIELDS = frozenset({
+    "source_url", "author", "captured_at", "contributor", "rationale",
+    "definition_file",
+})
+
+
 def source_path_records(item: dict) -> Iterator[dict]:
     """Yield the primary record and well-formed nested provenance records."""
     yield item
@@ -35,7 +41,13 @@ def retain_live_provenance(
         return None
     result = dict(node)
     primary = result.get("source_file")
-    if not isinstance(primary, str) or source_is_stale(primary):
+    promote_primary = not isinstance(primary, str) or source_is_stale(primary)
+    if len(kept) != len(entries) or promote_primary:
+        # Dedup can import scalar attributes from any losing contributor. Once
+        # evidence is removed, these fields no longer have provable ownership.
+        for field in _SOURCE_BOUND_FIELDS:
+            result.pop(field, None)
+    if promote_primary:
         result["source_file"] = kept[0]["source_file"]
         result["source_location"] = kept[0].get("source_location")
     if len(kept) > 1:

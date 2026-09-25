@@ -10,6 +10,8 @@ from graphify.build import build, build_merge, merge_raw_extraction
 from graphify.cache import _absolutize_source_files_in, _relativize_source_files_in
 from graphify.dedup import deduplicate_entities
 from graphify.watch import _rebase_relative_source_files, _relativize_source_files
+from graphify.watch import _rebuild_code
+from graphify.provenance import retain_live_provenance
 
 
 def _merged_rationale() -> dict:
@@ -47,6 +49,66 @@ def test_raw_prune_removes_secondary_and_primary_contributors(tmp_path: Path) ->
         assert all(
             item["source_file"] != pruned
             for item in survivor.get("source_provenance", [])
+        )
+
+
+def test_primary_promotion_clears_old_source_metadata() -> None:
+    node = _merged_rationale()
+    node.update(source_url="https://old.invalid/a", author="Old author",
+                captured_at="old-time", contributor="Old contributor",
+                rationale="Old rationale", definition_file="findings.md")
+    promoted = retain_live_provenance(
+        node, lambda path: path == "findings.md"
+    )
+    assert promoted is not None
+    assert promoted["source_file"] == "task_plan.md"
+    assert promoted["source_location"] == "L69"
+    for field in ("source_url", "author", "captured_at", "contributor",
+                  "rationale", "definition_file"):
+        assert field not in promoted
+
+
+def test_secondary_removal_clears_unowned_merged_metadata() -> None:
+    node = _merged_rationale()
+    node.update(source_url="https://secondary.invalid/a",
+                rationale="Imported from secondary")
+    retained = retain_live_provenance(
+        node, lambda path: path == "task_plan.md"
+    )
+    assert retained is not None
+    assert retained["source_file"] == "findings.md"
+    assert "source_url" not in retained
+    assert "rationale" not in retained
+
+
+def test_secondary_pruned_when_missing_or_newly_ignored(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "app.py").write_text("def app():\n    return 1\n")
+    (corpus / "findings.md").write_text("# Findings\n")
+    secondary = corpus / "task_plan.md"
+    secondary.write_text("# Task Plan\n")
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False)
+    graph_path = corpus / "graphify-out" / "graph.json"
+
+    for mode in ("missing", "ignored"):
+        graph = json.loads(graph_path.read_text())
+        semantic = _merged_rationale()
+        semantic["_origin"] = "semantic"
+        graph["nodes"].append(semantic)
+        graph_path.write_text(json.dumps(graph))
+        if mode == "missing":
+            secondary.unlink()
+        else:
+            secondary.write_text("# Task Plan\n")
+            (corpus / ".graphifyignore").write_text("task_plan.md\n")
+        assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False)
+        after = json.loads(graph_path.read_text())
+        survivor = next(n for n in after["nodes"] if n["id"] == "findings_rationale")
+        assert survivor["source_file"] == "findings.md"
+        assert all(
+            entry["source_file"] != "task_plan.md"
+            for entry in survivor.get("source_provenance", [])
         )
 
 

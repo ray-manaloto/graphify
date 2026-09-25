@@ -378,7 +378,13 @@ def build_cli_invocation(
         raise ValueError("managed invocation project_root and cwd must be existing directories")
     actual_cwd = requested_cwd.resolve(strict=bool(profile.get("_explicit")))
     actual_root = requested_root.resolve(strict=bool(profile.get("_explicit")))
-    if policy["project_configuration"] != "isolated":
+    if policy["project_configuration"] == "isolated":
+        if actual_cwd.is_relative_to(actual_root):
+            raise ValueError("isolated CLI cwd must be outside project_root")
+        if any((parent / ".codex" / "config.toml").exists()
+               for parent in (actual_cwd, *actual_cwd.parents)):
+            raise ValueError("isolated CLI cwd inherits project configuration")
+    else:
         try:
             actual_cwd.relative_to(actual_root)
         except ValueError as exc:
@@ -659,17 +665,23 @@ def run_cli_invocation(
     if context:
         if invocation.get("project_root") != context["project_root"]:
             raise ValueError("invocation project_root differs from run_context.project_root")
-        if invocation.get("cwd") != context["cwd"]:
-            policy = invocation.get("requested_profile", {}).get("cli_policy", {})
-            cwd = Path(invocation["cwd"])
-            project_root = Path(context["project_root"])
-            if policy.get("project_configuration") != "isolated":
-                raise ValueError("invocation cwd differs from run_context.cwd")
-            if not cwd.is_dir() or cwd.is_relative_to(project_root):
+        policy = invocation.get("requested_profile", {}).get("cli_policy", {})
+        cwd = Path(invocation["cwd"])
+        project_root = Path(context["project_root"])
+        if policy.get("project_configuration") == "isolated":
+            if not cwd.is_dir():
+                raise ValueError("isolated CLI cwd must be outside project_root")
+            cwd = cwd.resolve(strict=True)
+            project_root = project_root.resolve(strict=True)
+            if cwd.is_relative_to(project_root):
                 raise ValueError("isolated CLI cwd must be outside project_root")
             if any((parent / ".codex" / "config.toml").exists()
                    for parent in (cwd, *cwd.parents)):
                 raise ValueError("isolated CLI cwd inherits project configuration")
+            if "--ignore-user-config" not in invocation.get("argv", []):
+                raise ValueError("isolated CLI requires --ignore-user-config")
+        elif invocation.get("cwd") != context["cwd"]:
+            raise ValueError("invocation cwd differs from run_context.cwd")
     try:
         process = runner(deepcopy(invocation))
     except BaseException as exc:
