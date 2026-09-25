@@ -33,6 +33,7 @@ import networkx as nx
 from .ids import make_id, normalize_id as _normalize_id
 from .paths import default_graph_json as _default_graph_json
 from .paths import is_absolute_any_platform as _is_abs
+from .provenance import retain_live_provenance, source_path_records
 from .validate import validate_extraction
 
 
@@ -1049,6 +1050,13 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
                 continue
             if "source_file" in node:
                 node["source_file"] = _norm_source_file(node["source_file"], _root)
+            for contribution in source_path_records(node):
+                if contribution is node:
+                    continue
+                if contribution.get("source_file"):
+                    contribution["source_file"] = _norm_source_file(
+                        contribution["source_file"], _root
+                    )
             # definition_file names a file inside the scanned tree exactly like
             # source_file (the #2990 decl/def merge stamps it from the impl's
             # source_file BEFORE this normalization runs), so it must be made
@@ -1920,7 +1928,16 @@ def merge_raw_extraction(
             if prior_count > 1 and fresh_count < prior_count:
                 unverified_semantic_shrink[canon_sf] = (prior_count, fresh_count)
 
-    new["nodes"] = [n for n in existing_nodes if not _dropped(n)] + list(new.get("nodes", []))
+    live_existing_nodes = []
+    for node in existing_nodes:
+        if not isinstance(node, dict):
+            continue
+        live = retain_live_provenance(
+            node, lambda sf: _dropped({**node, "source_file": sf})
+        )
+        if live is not None and not _dropped(live):
+            live_existing_nodes.append(live)
+    new["nodes"] = live_existing_nodes + list(new.get("nodes", []))
     new["edges"] = [e for e in existing_edges if not _dropped(e)] + list(new.get("edges", []))
     carried_hyper = [he for he in existing_hyperedges if not _dropped(he)]
     if carried_hyper or new.get("hyperedges"):
@@ -2177,6 +2194,24 @@ def build_merge(
             if he.get("id") and he.get("id") in _new_hyperedge_ids:
                 continue  # the new chunks re-emitted it — theirs wins
             carried.append(he)
+
+    live_existing_nodes = []
+    for node in existing_nodes:
+        if not isinstance(node, dict):
+            continue
+        own_sources = new_ast_sources if _is_ast_tier(node) else new_sem_sources
+
+        def stale_contributor(sf: str) -> bool:
+            return (
+                sf in own_sources
+                or _norm_source_file(sf, _eff_root) in own_sources
+                or _prune_match(sf)
+            )
+
+        live = retain_live_provenance(node, stale_contributor)
+        if live is not None:
+            live_existing_nodes.append(live)
+    existing_nodes = live_existing_nodes
 
     # Remove replaced deleted-source records before entity dedup can choose their stale
     # provenance over a freshly emitted node with the same ID. A Terraform
