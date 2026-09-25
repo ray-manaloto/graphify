@@ -1152,6 +1152,40 @@ def test_managed_openai_ignores_user_config_with_distinct_cache_identity(tmp_pat
     assert "--ignore-user-config" not in _invocation(tmp_path, inherited)["argv"]
 
 
+def test_managed_openai_isolates_project_config_and_cleans_neutral_cwd(tmp_path):
+    profile = _profile()
+    profile["cli_policy"]["project_configuration"] = "isolated"
+    profile["cli_policy"]["mcp"] = "isolated-config"
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(
+        '[mcp_servers.project_test]\ncommand = "should-not-start"\n'
+    )
+    observed = []
+
+    def runner(invocation):
+        cwd = Path(invocation["cwd"])
+        assert cwd.is_dir() and not cwd.is_relative_to(tmp_path)
+        assert "--ignore-user-config" in invocation["argv"]
+        observed.append(cwd)
+        return _process(invocation)
+
+    llm._call_openai_cli(
+        "prompt", execution_profile=profile, run_context=_context(tmp_path),
+        process_runner=runner, receipt_sink=_ack([]),
+    )
+    assert len(observed) == 1 and not observed[0].exists()
+    assert execution.execution_profile_fingerprint(profile) != (
+        execution.execution_profile_fingerprint(_profile())
+    )
+
+
+def test_isolated_project_config_rejects_incomplete_policy(tmp_path):
+    profile = _profile()
+    profile["cli_policy"]["project_configuration"] = "isolated"
+    with pytest.raises(ValueError, match="requires isolated-config"):
+        _invocation(tmp_path, profile)
+
+
 def test_claude_rejects_openai_user_config_policy_before_invocation(tmp_path):
     profile = _profile("claude-cli")
     profile["cli_policy"]["mcp"] = "ignore-user-config"

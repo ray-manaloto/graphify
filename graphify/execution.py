@@ -201,9 +201,9 @@ def resolve_execution_profile(
     if not isinstance(policy, dict) or set(policy) != expected_policy:
         raise ValueError(f"cli_policy must contain exactly {sorted(expected_policy)}")
     allowed_policy = {
-        "project_configuration": {"inherit", "legacy"},
+        "project_configuration": {"inherit", "legacy", "isolated"},
         "session_persistence": {"retain", "legacy-disable"},
-        "mcp": {"inherit", "legacy-disable", "ignore-user-config"},
+        "mcp": {"inherit", "legacy-disable", "ignore-user-config", "isolated-config"},
         "sandbox": {"read-only", "provider-default"},
     }
     for key, choices in allowed_policy.items():
@@ -211,6 +211,10 @@ def resolve_execution_profile(
             raise ValueError(f"invalid cli_policy.{key}: {policy[key]!r}")
     if policy["mcp"] == "ignore-user-config" and resolved_backend != "openai-cli":
         raise ValueError("ignore-user-config MCP policy requires openai-cli")
+    if (policy["project_configuration"] == "isolated") != (policy["mcp"] == "isolated-config"):
+        raise ValueError("isolated project configuration requires isolated-config MCP policy")
+    if policy["mcp"] == "isolated-config" and resolved_backend != "openai-cli":
+        raise ValueError("isolated-config MCP policy requires openai-cli")
 
     identity = execution_profile.get("identity_policy")
     if not isinstance(identity, dict) or set(identity) != {
@@ -374,10 +378,11 @@ def build_cli_invocation(
         raise ValueError("managed invocation project_root and cwd must be existing directories")
     actual_cwd = requested_cwd.resolve(strict=bool(profile.get("_explicit")))
     actual_root = requested_root.resolve(strict=bool(profile.get("_explicit")))
-    try:
-        actual_cwd.relative_to(actual_root)
-    except ValueError as exc:
-        raise ValueError("invocation cwd must be inside project_root") from exc
+    if policy["project_configuration"] != "isolated":
+        try:
+            actual_cwd.relative_to(actual_root)
+        except ValueError as exc:
+            raise ValueError("invocation cwd must be inside project_root") from exc
 
     normalized_attachments = _validated_attachments(attachments)
     raster_attachments = [item for item in normalized_attachments if item.get("kind") == "raster"]
@@ -410,7 +415,7 @@ def build_cli_invocation(
         argv = [str(binary), "exec", "--skip-git-repo-check", "--json"]
         if policy["sandbox"] == "read-only":
             argv.extend(["--sandbox", "read-only"])
-        if policy["mcp"] == "ignore-user-config":
+        if policy["mcp"] in ("ignore-user-config", "isolated-config"):
             argv.append("--ignore-user-config")
         if policy["mcp"] == "legacy-disable":
             argv.extend(legacy_mcp_args or [])
@@ -655,7 +660,16 @@ def run_cli_invocation(
         if invocation.get("project_root") != context["project_root"]:
             raise ValueError("invocation project_root differs from run_context.project_root")
         if invocation.get("cwd") != context["cwd"]:
-            raise ValueError("invocation cwd differs from run_context.cwd")
+            policy = invocation.get("requested_profile", {}).get("cli_policy", {})
+            cwd = Path(invocation["cwd"])
+            project_root = Path(context["project_root"])
+            if policy.get("project_configuration") != "isolated":
+                raise ValueError("invocation cwd differs from run_context.cwd")
+            if not cwd.is_dir() or cwd.is_relative_to(project_root):
+                raise ValueError("isolated CLI cwd must be outside project_root")
+            if any((parent / ".codex" / "config.toml").exists()
+                   for parent in (cwd, *cwd.parents)):
+                raise ValueError("isolated CLI cwd inherits project configuration")
     try:
         process = runner(deepcopy(invocation))
     except BaseException as exc:
