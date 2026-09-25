@@ -203,12 +203,14 @@ def resolve_execution_profile(
     allowed_policy = {
         "project_configuration": {"inherit", "legacy"},
         "session_persistence": {"retain", "legacy-disable"},
-        "mcp": {"inherit", "legacy-disable"},
+        "mcp": {"inherit", "legacy-disable", "ignore-user-config"},
         "sandbox": {"read-only", "provider-default"},
     }
     for key, choices in allowed_policy.items():
         if policy[key] not in choices:
             raise ValueError(f"invalid cli_policy.{key}: {policy[key]!r}")
+    if policy["mcp"] == "ignore-user-config" and resolved_backend != "openai-cli":
+        raise ValueError("ignore-user-config MCP policy requires openai-cli")
 
     identity = execution_profile.get("identity_policy")
     if not isinstance(identity, dict) or set(identity) != {
@@ -408,6 +410,8 @@ def build_cli_invocation(
         argv = [str(binary), "exec", "--skip-git-repo-check", "--json"]
         if policy["sandbox"] == "read-only":
             argv.extend(["--sandbox", "read-only"])
+        if policy["mcp"] == "ignore-user-config":
+            argv.append("--ignore-user-config")
         if policy["mcp"] == "legacy-disable":
             argv.extend(legacy_mcp_args or [])
         if profile.get("effort"):

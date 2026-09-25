@@ -1136,6 +1136,29 @@ def test_managed_legacy_mcp_suppression_fails_closed_before_runner(tmp_path):
     assert called is False
 
 
+def test_managed_openai_ignores_user_config_with_distinct_cache_identity(tmp_path):
+    inherited = _profile()
+    isolated = _profile()
+    isolated["cli_policy"]["mcp"] = "ignore-user-config"
+    invocation = _invocation(tmp_path, isolated)
+    argv = invocation["argv"]
+    assert argv.count("--ignore-user-config") == 1
+    assert argv[1:4] == ["exec", "--skip-git-repo-check", "--json"]
+    assert ["--model", "gpt-5.6-sol"] == argv[argv.index("--model") : argv.index("--model") + 2]
+    assert ["-c", "model_reasoning_effort=high"] == argv[
+        argv.index("model_reasoning_effort=high") - 1 : argv.index("model_reasoning_effort=high") + 1
+    ]
+    assert execution.execution_profile_fingerprint(inherited) != execution.execution_profile_fingerprint(isolated)
+    assert "--ignore-user-config" not in _invocation(tmp_path, inherited)["argv"]
+
+
+def test_claude_rejects_openai_user_config_policy_before_invocation(tmp_path):
+    profile = _profile("claude-cli")
+    profile["cli_policy"]["mcp"] = "ignore-user-config"
+    with pytest.raises(ValueError, match="requires openai-cli"):
+        _invocation(tmp_path, profile)
+
+
 def test_managed_capture_false_fails_before_temp_or_runner(monkeypatch, tmp_path):
     monkeypatch.setattr(
         tempfile,
