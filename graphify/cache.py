@@ -18,6 +18,7 @@ from pathlib import Path
 # (#1423); re-exported here as _GRAPHIFY_OUT for the existing call sites.
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 from graphify.paths import os_replace_with_fallback as _os_replace_with_fallback
+from graphify.provenance import source_path_records
 from graphify.raster import is_supported_raster_path
 from graphify.execution import (
     MANAGED_CLAUDE_DEEP_ARGS,
@@ -626,28 +627,29 @@ def _relativize_source_files_in(payload: dict, root: Path) -> None:
         for item in payload.get(bucket, []):
             if not isinstance(item, dict):
                 continue
-            for key in ("source_file", "definition_file"):
-                source = item.get(key)
-                if not source:
-                    continue
-                sp = Path(source)
-                if not sp.is_absolute():
-                    # os.path.abspath is lexical (no symlink resolution),
-                    # matching the symbolic relativization below.
-                    cwd_form = Path(os.path.abspath(sp))
-                    try:
-                        if cwd_form == root_resolved / sp or not cwd_form.exists():
-                            continue  # already root-relative, or a ghost path
-                    except OSError:
+            for record in source_path_records(item):
+                for key in ("source_file", "definition_file"):
+                    source = record.get(key)
+                    if not source:
                         continue
-                    sp = cwd_form
-                try:
-                    rel = os.path.relpath(sp, root_resolved)
-                except (ValueError, OSError):
-                    continue  # out-of-root (e.g. Windows cross-drive)
-                if rel == ".." or rel.startswith(".." + os.sep) or rel.startswith("../"):
-                    continue  # escaped root — keep absolute
-                item[key] = rel.replace(os.sep, "/")
+                    sp = Path(source)
+                    if not sp.is_absolute():
+                        # os.path.abspath is lexical (no symlink resolution),
+                        # matching the symbolic relativization below.
+                        cwd_form = Path(os.path.abspath(sp))
+                        try:
+                            if cwd_form == root_resolved / sp or not cwd_form.exists():
+                                continue  # already root-relative, or a ghost path
+                        except OSError:
+                            continue
+                        sp = cwd_form
+                    try:
+                        rel = os.path.relpath(sp, root_resolved)
+                    except (ValueError, OSError):
+                        continue  # out-of-root (e.g. Windows cross-drive)
+                    if rel == ".." or rel.startswith(".." + os.sep) or rel.startswith("../"):
+                        continue  # escaped root — keep absolute
+                    record[key] = rel.replace(os.sep, "/")
 
 
 def _normalize_source_file_value(src: "str | Path", root_resolved: Path) -> str:
@@ -931,17 +933,18 @@ def _absolutize_source_files_in(payload: dict, root: Path) -> None:
             if not isinstance(item, dict):
                 continue
             # Mirror of the relativize side: definition_file re-anchors too (#3223).
-            for key in ("source_file", "definition_file"):
-                source = item.get(key)
-                if not source:
-                    continue
-                sp = Path(source)
-                if sp.is_absolute():
-                    continue
-                try:
-                    item[key] = str(root_resolved / sp)
-                except (TypeError, OSError):
-                    continue
+            for record in source_path_records(item):
+                for key in ("source_file", "definition_file"):
+                    source = record.get(key)
+                    if not source:
+                        continue
+                    sp = Path(source)
+                    if sp.is_absolute():
+                        continue
+                    try:
+                        record[key] = str(root_resolved / sp)
+                    except (TypeError, OSError):
+                        continue
 
 
 def cache_dir(

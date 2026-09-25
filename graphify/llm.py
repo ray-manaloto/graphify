@@ -2117,11 +2117,21 @@ def _managed_cli_call(
     import tempfile
 
     output_path: Path | None = None
+    isolated_workspace: tempfile.TemporaryDirectory[str] | None = None
     try:
         if backend == "openai-cli":
             output_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
             output_path = Path(output_file.name)
             output_file.close()
+
+        cli_cwd = actual_cwd
+        cli_root = actual_root
+        if backend == "openai-cli" and profile["cli_policy"]["mcp"] == "isolated-config":
+            # Codex's --ignore-user-config does not suppress a trusted
+            # project's .codex/config.toml. A neutral cwd prevents that
+            # project configuration and its MCP servers from being loaded.
+            isolated_workspace = tempfile.TemporaryDirectory(prefix="graphify-codex-")
+            cli_cwd = Path(isolated_workspace.name)
 
         invocation = build_cli_invocation(
             prompt,
@@ -2131,8 +2141,8 @@ def _managed_cli_call(
             attachments=attachments,
             profile=profile,
             output_path=output_path,
-            project_root=actual_root,
-            cwd=actual_cwd,
+            project_root=cli_root,
+            cwd=cli_cwd,
             legacy_mcp_args=legacy_mcp_args,
         )
         if effective_managed and backend == "claude-cli" and purpose == "extract" and deep_mode:
@@ -2260,6 +2270,8 @@ def _managed_cli_call(
                 output_path.unlink()
             except OSError:
                 pass
+        if isolated_workspace is not None:
+            isolated_workspace.cleanup()
 
 
 def _call_claude_cli(

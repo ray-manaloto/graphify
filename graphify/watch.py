@@ -17,6 +17,7 @@ from graphify.paths import (
     is_absolute_any_platform,
     os_replace_with_fallback,
 )
+from graphify.provenance import retain_live_provenance, source_path_records
 
 logger = logging.getLogger(__name__)
 _PENDING_FILENAME = ".pending_changes"
@@ -356,20 +357,21 @@ _PORTABLE_PATH_KEYS = ("source_file", "definition_file")
 def _relativize_source_files(payload: dict, root: Path, *, scope: Path | None = None) -> None:
     for bucket in ("nodes", "edges", "hyperedges"):
         for item in payload.get(bucket, []):
-            for key in _PORTABLE_PATH_KEYS:
-                source = item.get(key)
-                if not source:
-                    continue
-                source_path = Path(source)
-                if not source_path.is_absolute():
-                    continue
-                try:
-                    resolved = source_path.resolve()
-                    if scope is not None and not _is_relative_to(resolved, scope):
+            for record in source_path_records(item):
+                for key in _PORTABLE_PATH_KEYS:
+                    source = record.get(key)
+                    if not source:
                         continue
-                    item[key] = resolved.relative_to(root).as_posix()
-                except ValueError:
-                    continue
+                    source_path = Path(source)
+                    if not source_path.is_absolute():
+                        continue
+                    try:
+                        resolved = source_path.resolve()
+                        if scope is not None and not _is_relative_to(resolved, scope):
+                            continue
+                        record[key] = resolved.relative_to(root).as_posix()
+                    except ValueError:
+                        continue
 
 
 def _rebase_relative_source_files(payload: dict, source_root: Path, target_root: Path) -> None:
@@ -378,14 +380,15 @@ def _rebase_relative_source_files(payload: dict, source_root: Path, target_root:
         return
     for bucket in ("nodes", "edges", "hyperedges"):
         for item in payload.get(bucket, []):
-            for key in _PORTABLE_PATH_KEYS:
-                source = item.get(key)
-                if not source or Path(source).is_absolute():
-                    continue
-                try:
-                    item[key] = (source_root / source).relative_to(target_root).as_posix()
-                except ValueError:
-                    continue
+            for record in source_path_records(item):
+                for key in _PORTABLE_PATH_KEYS:
+                    source = record.get(key)
+                    if not source or Path(source).is_absolute():
+                        continue
+                    try:
+                        record[key] = (source_root / source).relative_to(target_root).as_posix()
+                    except ValueError:
+                        continue
 
 
 class _StoredSourcePaths:
@@ -516,19 +519,20 @@ class _StoredSourcePaths:
         return self.identity(item.get("source_file")) in identities
 
     def rebase_preserved(self, item: dict) -> None:
-        identity = self.identity(item.get("source_file"))
-        if not identity:
-            return
-        identity_path = Path(identity)
-        if not _is_relative_to(identity_path, self.watch_root):
-            normalized = self.normalize(item.get("source_file"))
-            if normalized:
-                item["source_file"] = normalized
-            return
-        try:
-            item["source_file"] = identity_path.relative_to(self.project_root).as_posix()
-        except ValueError:
-            item["source_file"] = identity
+        for record in source_path_records(item):
+            identity = self.identity(record.get("source_file"))
+            if not identity:
+                continue
+            identity_path = Path(identity)
+            if not _is_relative_to(identity_path, self.watch_root):
+                normalized = self.normalize(record.get("source_file"))
+                if normalized:
+                    record["source_file"] = normalized
+                continue
+            try:
+                record["source_file"] = identity_path.relative_to(self.project_root).as_posix()
+            except ValueError:
+                record["source_file"] = identity
 
 
 # A source_file that is a URL/virtual scheme (gdoc://, s3://, http://, ...) rather
@@ -979,9 +983,36 @@ def _reconcile_existing_graph(
         # sources. Semantic-tier nodes (per _is_ast_tier) remain preserved.
         # Nodes explicitly classified as fail-closed preserved (#3695) must
         # not subsequently be removed by this AST ownership pass.
+        live_existing_nodes = []
+        fresh_nodes_by_id = {node["id"]: node for node in result["nodes"]}
+        for node in existing.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+
+            def stale_contributor(source_file: str) -> bool:
+                identity = source_paths.identity(source_file)
+                if identity in excluded_alive_files:
+                    return False
+                return identity in node_evicted_source_identities or (
+                    full_rebuild and _is_ast_tier(node)
+                    and identity in rebuilt_source_identities
+                )
+
+            live = retain_live_provenance(node, stale_contributor)
+            if live is None:
+                continue
+            if node.get("source_provenance") and live["id"] in fresh_nodes_by_id:
+                from graphify.dedup import _merged_source_provenance
+
+                fresh = fresh_nodes_by_id[live["id"]]
+                provenance = _merged_source_provenance([live, fresh])
+                if len({entry["source_file"] for entry in provenance}) > 1:
+                    fresh["source_provenance"] = provenance
+            live_existing_nodes.append(live)
+
         preserved_nodes = [
             node
-            for node in existing.get("nodes", [])
+            for node in live_existing_nodes
             if node["id"] not in new_ast_ids
             and not (
                 _is_ast_tier(node)
