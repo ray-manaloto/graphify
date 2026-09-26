@@ -1,0 +1,6 @@
+[tasks.fork-maintenance]
+description = "Preview or apply a frozen Graphify fork-maintenance plan"
+quiet = true
+usage = 'arg "[args]" var=#true help="Arguments forwarded verbatim to tools.fork_maintenance"'
+raw_args = true
+run = "uv run --frozen python -m tools.fork_maintenance"
