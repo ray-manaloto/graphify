@@ -4824,6 +4824,15 @@ def test_kotlin_body_property_annotation_emits_attribute_edge(tmp_path):
     refs = _edge_labels(result, "references", "attribute")
     assert ("Foo", "Transient") in refs
 
+
+def test_kotlin_inferred_property_annotation_emits_attribute_edge(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "InferredProperty.kt"
+    source.write_text("class Foo {\n    companion object {\n        @JvmField\n        val INSTANCE = Foo()\n    }\n}\n")
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("Foo", "JvmField") in refs
+
 def test_kotlin_bracketed_annotations_emits_multiple_attribute_edges(tmp_path):
     from graphify.extract import extract_kotlin
     source = tmp_path / "BracketedAnnotations.kt"
