@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import hashlib
 import json
 import math
@@ -3108,6 +3109,7 @@ class TerminalArgumentParser(argparse.ArgumentParser):
         # A closed caller stream must reach our terminal refusal boundary.
         if sys.version_info >= (3, 14):
             kwargs.setdefault("color", False)
+            kwargs.setdefault("formatter_class", partial(argparse.HelpFormatter, color=False))
         super().__init__(*args, **kwargs)
 
     def _print_message(self, message: str, file: Any = None) -> None:
