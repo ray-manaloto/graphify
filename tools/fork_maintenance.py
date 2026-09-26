@@ -3103,6 +3103,13 @@ def add_shared_limits(parser: argparse.ArgumentParser) -> None:
 class TerminalArgumentParser(argparse.ArgumentParser):
     """Use the same no-retry output boundary for help and usage diagnostics."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Python 3.14 probes stdout while constructing colorized formatters.
+        # A closed caller stream must reach our terminal refusal boundary.
+        if sys.version_info >= (3, 14):
+            kwargs.setdefault("color", False)
+        super().__init__(*args, **kwargs)
+
     def _print_message(self, message: str, file: Any = None) -> None:
         if message:
             write_terminal(message, stream=file if file is not None else sys.stderr, end="")
