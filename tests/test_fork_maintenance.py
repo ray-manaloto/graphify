@@ -4727,8 +4727,11 @@ def test_public_preview_http_failure_retains_bounded_raw_and_structured_evidence
 
     server = metadata_server({"/releases": fail, "*": missing})
     plan = tmp_path / "plan.json"
+    # The 503 arm verifies response evidence, not process-start latency. Keep
+    # the deliberately short budget only for the separate timeout arm.
+    network_timeout = "0.3" if failure == "timeout" else "2"
     result = preview_live(
-        repos, server, plan, "--network-timeout", "0.3", "--attempt-timeout", "30",
+        repos, server, plan, "--network-timeout", network_timeout, "--attempt-timeout", "30",
     )
     assert result.returncode == (4 if failure == "timeout" else 2), (result.stdout, result.stderr)
     outcome = json.loads(result.stderr)
@@ -4788,7 +4791,7 @@ def test_public_http_failure_cleanup_reuses_worker_shutdown_deadline(
         "--upstream-url", str(repos["upstream"]),
         "--github-releases-url", f"{server.url}/releases?page=1",
         "--pypi-base-url", server.url,
-        "--network-timeout", "0.5", "--attempt-timeout", "300",
+        "--network-timeout", "2", "--attempt-timeout", "300",
         "--output-plan", str(plan),
     ]
     try:
@@ -5689,7 +5692,7 @@ def test_public_http_failure_response_encoding_cannot_extend_shutdown(
         "--upstream-url", str(repos["upstream"]),
         "--github-releases-url", f"{server.url}/releases?page=1",
         "--pypi-base-url", server.url,
-        "--network-timeout", "0.5", "--attempt-timeout", "300",
+        "--network-timeout", "2", "--attempt-timeout", "300",
         "--output-plan", str(plan),
     ])
     captured = capsys.readouterr()
@@ -5727,7 +5730,7 @@ def test_late_signal_during_http_failure_finalization_preserves_first_cause_and_
         "--upstream-url", str(repos["upstream"]),
         "--github-releases-url", f"{server.url}/releases?page=1",
         "--pypi-base-url", server.url,
-        "--network-timeout", "0.5", "--attempt-timeout", "30",
+        "--network-timeout", "2", "--attempt-timeout", "30",
         "--output-plan", str(plan),
     ])
     captured = capsys.readouterr()
