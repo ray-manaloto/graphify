@@ -60,6 +60,11 @@ jobs:
           # and the baseline tests fail. Full history mirrors the skillgen-check job.
           fetch-depth: 0
 
+      - name: Install mise for fork-maintenance tests
+        uses: jdx/mise-action@v4.3.0
+        with:
+          install: false
+
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
         with:
