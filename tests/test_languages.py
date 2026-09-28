@@ -3411,6 +3411,29 @@ def test_markdown_dot_directory_policy_change_invalidates_cache(tmp_path):
     assert len(references(None)) == 1
 
 
+def test_markdown_git_index_status_invalidates_link_cache(tmp_path):
+    """Tracking an ignored target changes link eligibility without changing files."""
+    import subprocess
+
+    from graphify.extract import extract
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    source = tmp_path / "entry.md"
+    source.write_text("See [[secret]].\n", encoding="utf-8")
+    (tmp_path / "secret.md").write_text("# Secret\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("secret.md\n", encoding="utf-8")
+
+    def references():
+        graph = extract([source], root=tmp_path, cache_root=tmp_path, parallel=False)
+        return [edge for edge in graph["edges"] if edge["relation"] == "references"]
+
+    assert references() == []
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-f", "secret.md"], check=True)
+    assert len(references()) == 1
+    subprocess.run(["git", "-C", str(tmp_path), "rm", "--cached", "-q", "secret.md"], check=True)
+    assert references() == []
+
+
 # ── Groovy ───────────────────────────────────────────────────────────────────
 
 

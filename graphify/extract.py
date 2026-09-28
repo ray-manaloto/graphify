@@ -6327,6 +6327,9 @@ def _markdown_cache_fingerprint(
                     digest.update(b"path\0")
                     digest.update(relative.encode("utf-8", errors="surrogateescape"))
                     digest.update(b"\0")
+                    # Git may exempt a tracked file from .gitignore without
+                    # changing its path or any ignore-file content.
+                    digest.update(b"included\0" if not ignored(path) else b"ignored\0")
                 if name in (".graphifyignore", ".gitignore"):
                     digest.update(b"policy\0")
                     digest.update(relative.encode("utf-8", errors="surrogateescape"))
