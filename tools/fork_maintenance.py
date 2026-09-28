@@ -3210,6 +3210,123 @@ def workflow_fixture_bindings(config: dict[str, Any]) -> dict[str, dict[str, str
     return bindings
 
 
+def workflow_environment_identity() -> dict[str, Any]:
+    """Bind the executable and policy inputs that can change deterministic replay."""
+    root = Path(__file__).resolve().parent.parent
+    git_path = shutil.which("git", path="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+    if git_path is None:
+        raise MaintenanceError("Git executable is unavailable for workflow identity")
+    files = {
+        "engine": Path(__file__).resolve(), "python": Path(sys.executable).resolve(),
+        "git": Path(git_path).resolve(),
+    }
+    for name in ("pyproject.toml", "uv.lock", "mise.toml"):
+        path = root / name
+        if path.is_file():
+            files[name] = path
+    return {
+        "files": {key: {"path": str(path), "sha256": sha256_bytes(path.read_bytes())}
+                  for key, path in files.items()},
+        "python_version": sys.version,
+        "import_environment": {name: os.environ.get(name)
+                               for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
+                                            "UV_PROJECT_ENVIRONMENT")},
+    }
+
+
+def workflow_checkpoint_input(stage: str, index: dict[str, Any],
+                              plan: dict[str, Any] | None = None) -> str:
+    config = index["config"]
+    fields: dict[str, Any] = {"stage": stage, "environment": index["environment_identity"]}
+    if stage == "preview":
+        fields["preview"] = config.get("preview")
+        fields["fixture_bindings"] = index.get("preview_fixture_bindings", {})
+    elif stage == "apply":
+        if plan is None or not index.get("plan_sha256"):
+            raise MaintenanceError("apply checkpoint requires exact frozen plan")
+        fields["plan_sha256"] = index["plan_sha256"]
+        fields["candidate"] = plan["candidate"]
+        fields["selection"] = plan["selection"]
+        fields["source_repository"] = plan["source_repository"]
+        fields["apply"] = config["apply"]
+    else:
+        raise MaintenanceError("unknown workflow checkpoint stage")
+    return sha256_bytes(canonical_json(fields))
+
+
+def workflow_progress(index: dict[str, Any]) -> dict[str, Any]:
+    stages = index.get("stages", {})
+    apply = stages.get("apply", {}) if isinstance(stages, dict) else {}
+    applied = isinstance(apply, dict) and apply.get("status") in {"applied", "replayed"}
+    qualified = bool(index.get("qualification_sidecar_sha256"))
+    invalidated = any(index.get(name) for name in (
+        "observed_config_drift", "observed_environment_drift", "observed_checkpoint_drift",
+        "target_invalidation", "currency_unknown", "terminal_stop"))
+    return {
+        "graphify": {"plan": "frozen" if index.get("plan_sha256") else "pending",
+                     "apply": "applied" if applied else "pending",
+                     "capability_qualification": "recorded" if qualified else "pending",
+                     "checkpoint_reuse": ("invalidated" if invalidated else
+                                          "requires_read_only_replay" if applied else "not_available"),
+                     "invalidation": index.get("target_invalidation"),
+                     "terminal_stop": index.get("terminal_stop")},
+        "knowledge_base": {"status": "pending_external_receipt"},
+        "dotfiles": {"status": "pending_external_receipt"},
+        "aggregate": "partial" if applied else "pending",
+    }
+
+
+def workflow_observe_checkpoints(index: dict[str, Any]) -> None:
+    expected_environment = index.get("environment_identity")
+    if not isinstance(expected_environment, dict) or expected_environment != workflow_environment_identity():
+        index["observed_environment_drift"] = True
+        return
+    if index.get("observed_config_drift"):
+        return
+    plan_path = Path(index["config"]["apply"]["plan"])
+    stages = index["stages"]
+    for stage in ("preview", "apply"):
+        receipt = stages.get(stage)
+        if receipt is None:
+            continue
+        if not isinstance(receipt, dict):
+            index["observed_checkpoint_drift"] = f"{stage}_receipt_malformed"
+            return
+        if receipt.get("status") not in (
+            {"planned"} if stage == "preview" else {"applied", "replayed"}
+        ):
+            continue
+        checkpoint = receipt.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            index["observed_checkpoint_drift"] = f"{stage}_checkpoint_missing"
+            return
+        if not plan_path.is_file():
+            index["observed_checkpoint_drift"] = f"{stage}_plan_missing"
+            return
+        if stage == "preview":
+            input_sha = workflow_checkpoint_input(stage, index)
+            output_sha = sha256_bytes(plan_path.read_bytes())
+        else:
+            pin = index.get("plan_sha256")
+            if not isinstance(pin, str):
+                index["observed_checkpoint_drift"] = "apply_plan_pin_missing"
+                return
+            try:
+                plan, _ = load_and_validate_plan(plan_path, pin)
+            except MaintenanceError:
+                index["observed_checkpoint_drift"] = "apply_plan_drift"
+                return
+            input_sha = workflow_checkpoint_input(stage, index, plan)
+            result_path = Path(index["config"]["apply"]["evidence_dir"]) / "result.json"
+            if not result_path.is_file():
+                index["observed_checkpoint_drift"] = "apply_result_missing"
+                return
+            output_sha = sha256_bytes(result_path.read_bytes())
+        if checkpoint != {"input_sha256": input_sha, "output_sha256": output_sha}:
+            index["observed_checkpoint_drift"] = f"{stage}_checkpoint_drift"
+            return
+
+
 def workflow_validate_plan_config(plan: dict[str, Any], config: dict[str, Any]) -> None:
     apply = config["apply"]
     if (plan["source_repository"].get("worktree") != str(Path(apply["source_repo"]).resolve()) or
@@ -3283,42 +3400,56 @@ def workflow_arguments(operation: str, fields: dict[str, str]) -> list[str]:
 
 
 def workflow_project(index: dict[str, Any], observed_plan_exists: bool | None) -> dict[str, Any]:
+    progress = workflow_progress(index)
+    if index.get("observed_config_drift"):
+        return {"status": "stopped", "next_action": "inspect_config_drift",
+                "stopped_reason": "workflow_config_drift", "progress": progress}
+    if index.get("observed_environment_drift"):
+        return {"status": "stopped", "next_action": "inspect_environment_drift",
+                "stopped_reason": "workflow_environment_drift", "progress": progress}
+    if index.get("observed_checkpoint_drift"):
+        return {"status": "stopped", "next_action": "inspect_checkpoint_drift",
+                "stopped_reason": index["observed_checkpoint_drift"], "progress": progress}
     if index.get("terminal_stop"):
         return {"status": "stopped", "next_action": "inspect_target_limit",
-                "stopped_reason": index["terminal_stop"]}
+                "stopped_reason": index["terminal_stop"], "progress": progress}
     if index.get("currency_unknown"):
         return {"status": "stopped", "next_action": "inspect_currency_unknown",
-                "stopped_reason": "currency_unknown"}
+                "stopped_reason": "currency_unknown", "progress": progress}
     if index.get("target_invalidation"):
         return {"status": "stopped", "next_action": "qualify_new_target",
-                "stopped_reason": "target_changed"}
+                "stopped_reason": "target_changed", "progress": progress}
     stages = index.get("stages", {})
     if not isinstance(stages, dict):
         raise MaintenanceError("workflow stages are malformed")
     if index.get("replay_failure"):
         return {"status": "stopped", "next_action": "inspect_replay_failure",
-                "stopped_reason": "replay_refused"}
+                "stopped_reason": "replay_refused", "progress": progress}
     for stage in ("preview", "apply"):
         receipt = stages.get(stage)
         if receipt is not None and (not isinstance(receipt, dict) or receipt.get("status") not in
                                     ({"planned"} if stage == "preview" else {"applied", "replayed"})):
-            return {"status": "stopped", "next_action": "inspect_failed_stage", "stopped_reason": stage}
+            return {"status": "stopped", "next_action": "inspect_failed_stage",
+                    "stopped_reason": stage, "progress": progress}
     if "apply" in stages:
         if index.get("qualification_sidecar_sha256"):
             return {"status": "stopped", "next_action": "await_fork_gates",
-                    "stopped_reason": "downstream_qualification_not_automated"}
+                    "stopped_reason": "downstream_qualification_not_automated",
+                    "progress": progress}
         return {"status": "stopped", "next_action": "qualify_capabilities",
-                "stopped_reason": "ticket788_sidecar_required"}
+                "stopped_reason": "ticket788_sidecar_required", "progress": progress}
     if "preview" in stages or observed_plan_exists is True:
         return {"status": "stopped", "next_action": "supply_external_plan_pin",
-                "stopped_reason": "exact_byte_plan_pin_required"}
+                "stopped_reason": "exact_byte_plan_pin_required", "progress": progress}
     if observed_plan_exists is None:
         return {"status": "stopped", "next_action": "inspect_plan_visibility",
-                "stopped_reason": "plan_visibility_unknown"}
-    return {"status": "ready", "next_action": "preview", "stopped_reason": None}
+                "stopped_reason": "plan_visibility_unknown", "progress": progress}
+    return {"status": "ready", "next_action": "preview", "stopped_reason": None,
+            "progress": progress}
 
 
-def workflow_load_index(path: Path, run_id: str, *, currency: bool = False) -> dict[str, Any]:
+def workflow_load_index(path: Path, run_id: str, *, currency: bool = False,
+                        allow_config_drift: bool = False) -> dict[str, Any]:
     try:
         content = path.read_bytes()
         index = json.loads(content)
@@ -3346,9 +3477,13 @@ def workflow_load_index(path: Path, run_id: str, *, currency: bool = False) -> d
     try:
         current_config = config_path.read_bytes()
     except OSError as exc:
-        raise MaintenanceError(f"workflow configuration unavailable: {exc}") from exc
-    if sha256_bytes(current_config) != index.get("config_file_sha256"):
+        if not allow_config_drift:
+            raise MaintenanceError(f"workflow configuration unavailable: {exc}") from exc
+        current_config = None
+    if (current_config is None or sha256_bytes(current_config) != index.get("config_file_sha256")) and not allow_config_drift:
         raise MaintenanceError("workflow configuration file drift")
+    if current_config is None or sha256_bytes(current_config) != index.get("config_file_sha256"):
+        index["observed_config_drift"] = True
     if not currency and workflow_fixture_bindings(config) != index.get("preview_fixture_bindings", {}):
         raise MaintenanceError("workflow release fixture identity drift")
     observations = index.get("currency_observations", [])
@@ -3617,6 +3752,11 @@ def workflow_currency(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     """Record a diagnostic boundary observation; never promote or rewrite a plan."""
     index_path = Path(args.evidence_index).resolve()
     index = workflow_load_index(index_path, args.run_id, currency=True)
+    workflow_observe_checkpoints(index)
+    if any(index.get(name) for name in (
+        "observed_config_drift", "observed_environment_drift", "observed_checkpoint_drift"
+    )):
+        return {"run_id": args.run_id, **workflow_project(index, True)}, EXIT_REFUSED
     if index.get("terminal_stop") or index.get("currency_unknown"):
         return {"run_id": args.run_id, **workflow_project(index, True)}, EXIT_REFUSED
     config = index["config"]
@@ -3764,13 +3904,21 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                  "config": config, "config_path": str(config_path),
                  "config_file_sha256": sha256_bytes(config_bytes),
                  "immutable_config_sha256": sha256_bytes(canonical_json(config)),
+                 "environment_identity": workflow_environment_identity(),
                  "preview_fixture_bindings": workflow_fixture_bindings(config),
                  "stages": {}, "target_attempts": []}
         exclusive_write_bytes(index_path, workflow_index_bytes(index))
     else:
         run_id = args.run_id
-        index = workflow_load_index(index_path, run_id, currency=True)
+        index = workflow_load_index(index_path, run_id, currency=True, allow_config_drift=True)
         config = index["config"]
+        workflow_observe_checkpoints(index)
+        if any(index.get(name) for name in (
+            "observed_config_drift", "observed_environment_drift", "observed_checkpoint_drift"
+        )):
+            code = 0 if args.operation == "status" else EXIT_REFUSED
+            return {"run_id": run_id, **workflow_project(index, True),
+                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, code
         if args.operation == "resume" and not (
             index.get("terminal_stop") or index.get("target_invalidation") or
             index.get("currency_unknown")
@@ -3798,13 +3946,15 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         ):
             return {"run_id": run_id, "status": "stopped",
                     "next_action": "recheck_currency", "stopped_reason": "release_fixture_drift",
-                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+                    "stages": index["stages"], "target_attempts": index["target_attempts"],
+                    "progress": workflow_progress(index)}, 0
         if index.get("plan_sha256") and (
             not observed or sha256_bytes(plan_path.read_bytes()) != index["plan_sha256"]
         ):
             return {"run_id": run_id, "status": "stopped",
                     "next_action": "inspect_plan_drift", "stopped_reason": "plan_pin_drift",
-                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+                    "stages": index["stages"], "target_attempts": index["target_attempts"],
+                    "progress": workflow_progress(index)}, 0
         sidecar_name = config.get("qualification_sidecar")
         if index.get("qualification_sidecar_sha256") and (
             not sidecar_name or not Path(sidecar_name).exists() or
@@ -3812,7 +3962,8 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         ):
             return {"run_id": run_id, "status": "stopped",
                     "next_action": "inspect_sidecar_drift", "stopped_reason": "sidecar_drift",
-                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+                    "stages": index["stages"], "target_attempts": index["target_attempts"],
+                    "progress": workflow_progress(index)}, 0
         if index.get("qualification_sidecar_sha256"):
             try:
                 frozen_plan, _ = load_and_validate_plan(plan_path, index["plan_sha256"])
@@ -3820,11 +3971,13 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             except MaintenanceError:
                 return {"run_id": run_id, "status": "stopped",
                         "next_action": "inspect_sidecar_drift", "stopped_reason": "sidecar_evidence_drift",
-                        "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+                        "stages": index["stages"], "target_attempts": index["target_attempts"],
+                        "progress": workflow_progress(index)}, 0
         if os.path.lexists(Path(config["apply"]["evidence_dir"]) / "attempt.lock"):
             return {"run_id": run_id, "status": "stopped",
                     "next_action": "inspect_retained_lock", "stopped_reason": "apply_ownership_uncertain",
-                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+                    "stages": index["stages"], "target_attempts": index["target_attempts"],
+                    "progress": workflow_progress(index)}, 0
         return {"run_id": run_id, **workflow_project(index, observed), "stages": index["stages"],
                 "target_attempts": index["target_attempts"]}, 0
     lock = Path(str(index_path) + ".lock")
@@ -3853,6 +4006,11 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 raise MaintenanceError("plan absent and preview inputs unavailable")
             receipt = workflow_stage("preview", config["preview"], index, index_path,
                                      prior_sha)
+            if receipt["direct_rc"] == 0 and receipt["status"] == "planned" and plan_path.is_file():
+                receipt["checkpoint"] = {
+                    "input_sha256": workflow_checkpoint_input("preview", index),
+                    "output_sha256": sha256_bytes(plan_path.read_bytes()),
+                }
             stages["preview"] = receipt
             workflow_save_index(index_path, index, sha256_bytes(index_path.read_bytes()))
             prior_sha = sha256_bytes(index_path.read_bytes())
@@ -3880,6 +4038,13 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if "apply" not in stages:
             receipt = workflow_stage("apply", {**config["apply"],
                 "expected_plan_sha256": observed_pin}, index, index_path, prior_sha)
+            result_path = Path(config["apply"]["evidence_dir"]) / "result.json"
+            if (receipt["direct_rc"] == 0 and receipt["status"] in {"applied", "replayed"}
+                    and result_path.is_file()):
+                receipt["checkpoint"] = {
+                    "input_sha256": workflow_checkpoint_input("apply", index, plan),
+                    "output_sha256": sha256_bytes(result_path.read_bytes()),
+                }
             stages["apply"] = receipt
             workflow_save_index(index_path, index, sha256_bytes(index_path.read_bytes()))
             if receipt["direct_rc"] != 0 or receipt["status"] not in {"applied", "replayed"}:

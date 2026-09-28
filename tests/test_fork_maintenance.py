@@ -313,6 +313,104 @@ def release_workflow(repos: dict[str, Any], tmp_path: Path) -> tuple[Path, Path,
     return index, plan, releases, pypi
 
 
+def checkpoint_workflow(repos: dict[str, Any], tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    plan = tmp_path / "plan.json"
+    assert preview_override(repos, plan).returncode == 0
+    pin = hashlib.sha256(plan.read_bytes()).hexdigest()
+    config, index, _, evidence = workflow_fixture(repos, tmp_path, plan, pin)
+    started = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert started.returncode == 2, started.stderr
+    assert json.loads(started.stderr)["next_action"] == "qualify_capabilities"
+    return config, index, plan, evidence
+
+
+def test_workflow_checkpoint_reuses_exact_inputs_and_reports_partial_progress(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    _, index, plan, evidence = checkpoint_workflow(repos, tmp_path)
+    state = json.loads(index.read_text())
+    checkpoint = state["stages"]["apply"]["checkpoint"]
+    assert checkpoint["output_sha256"] == hashlib.sha256((evidence / "result.json").read_bytes()).hexdigest()
+    assert checkpoint["input_sha256"]
+    before_index = index.read_bytes()
+    before_result = (evidence / "result.json").read_bytes()
+    before_plan = plan.read_bytes()
+    (tmp_path / "unrelated-note.txt").write_text("changed unrelated metadata", encoding="utf-8")
+    status = run_cli("status", "--evidence-index", str(index), "--run-id", state["run_id"])
+    assert status.returncode == 0
+    projection = json.loads(status.stdout)
+    assert projection["progress"]["graphify"]["apply"] == "applied"
+    assert projection["progress"]["graphify"]["checkpoint_reuse"] == "requires_read_only_replay"
+    assert projection["progress"]["knowledge_base"]["status"] == "pending_external_receipt"
+    assert projection["progress"]["dotfiles"]["status"] == "pending_external_receipt"
+    assert projection["progress"]["aggregate"] == "partial"
+    assert index.read_bytes() == before_index
+    public_status = subprocess.run(
+        ["mise", "run", "fork-maintenance", "--", "status", "--evidence-index", str(index),
+         "--run-id", state["run_id"], "--json"], cwd=ROOT, capture_output=True, text=True,
+        timeout=120,
+    )
+    assert public_status.returncode == 0, public_status.stderr
+    assert json.loads(public_status.stdout)["progress"] == projection["progress"]
+    assert index.read_bytes() == before_index
+    resumed = run_cli("resume", "--evidence-index", str(index), "--run-id", state["run_id"])
+    assert resumed.returncode == 2
+    assert json.loads(resumed.stderr)["next_action"] == "qualify_capabilities"
+    assert index.read_bytes() == before_index
+    assert plan.read_bytes() == before_plan
+    assert (evidence / "result.json").read_bytes() == before_result
+
+
+def test_workflow_config_environment_and_result_drift_invalidate_reuse(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    config, index, plan, evidence = checkpoint_workflow(repos, tmp_path)
+    state = json.loads(index.read_text())
+    run_id = state["run_id"]
+    before_index = index.read_bytes()
+    before_result = (evidence / "result.json").read_bytes()
+    before_config = config.read_bytes()
+    config.write_text(config.read_text() + "\n", encoding="utf-8")
+    status = run_cli("status", "--evidence-index", str(index), "--run-id", run_id)
+    assert status.returncode == 0
+    assert json.loads(status.stdout)["stopped_reason"] == "workflow_config_drift"
+    assert json.loads(status.stdout)["progress"]["graphify"]["apply"] == "applied"
+    refused = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
+    assert refused.returncode == 2
+    assert json.loads(refused.stderr)["stopped_reason"] == "workflow_config_drift"
+    assert index.read_bytes() == before_index
+    config.write_bytes(before_config)
+    changed_env = os.environ.copy()
+    changed_env["PYTHONPATH"] = "/tmp/graphify-fm05-environment-drift"
+    environment_status = run_cli("status", "--evidence-index", str(index),
+                                 "--run-id", run_id, env=changed_env)
+    assert environment_status.returncode == 0
+    assert json.loads(environment_status.stdout)["stopped_reason"] == "workflow_environment_drift"
+    environment_refused = run_cli("resume", "--evidence-index", str(index),
+                                  "--run-id", run_id, env=changed_env)
+    assert environment_refused.returncode == 2
+    assert json.loads(environment_refused.stderr)["stopped_reason"] == "workflow_environment_drift"
+    assert index.read_bytes() == before_index
+    result_path = evidence / "result.json"
+    result_path.write_bytes(before_result + b" ")
+    result_status = run_cli("status", "--evidence-index", str(index), "--run-id", run_id)
+    assert result_status.returncode == 0
+    assert json.loads(result_status.stdout)["stopped_reason"] == "apply_checkpoint_drift"
+    result_refused = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
+    assert result_refused.returncode == 2
+    assert json.loads(result_refused.stderr)["stopped_reason"] == "apply_checkpoint_drift"
+    assert index.read_bytes() == before_index
+    result_path.write_bytes(before_result)
+    frozen_plan = plan.read_bytes()
+    plan.write_bytes(frozen_plan + b" ")
+    target_status = run_cli("status", "--evidence-index", str(index), "--run-id", run_id)
+    assert target_status.returncode == 0
+    assert json.loads(target_status.stdout)["stopped_reason"] == "apply_plan_drift"
+    target_refused = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
+    assert target_refused.returncode == 2
+    assert json.loads(target_refused.stderr)["stopped_reason"] == "apply_plan_drift"
+    assert index.read_bytes() == before_index
+    assert result_path.read_bytes() == before_result
+
+
 def test_currency_same_release_at_each_boundary_is_diagnostic_only(tmp_path: Path) -> None:
     repos = make_repositories(tmp_path)
     index, plan, releases, _ = release_workflow(repos, tmp_path)
