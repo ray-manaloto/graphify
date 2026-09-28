@@ -361,6 +361,29 @@ def test_workflow_index_tamper_refuses_without_apply(tmp_path: Path) -> None:
     assert not evidence.exists()
 
 
+def test_workflow_outer_stage_timeout_keeps_captured_raw_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = load_engine()
+    index_path = tmp_path / "index.json"
+    index: dict[str, Any] = {"run_id": "fixture-run", "stages": {}}
+    index_path.write_bytes(engine.workflow_index_bytes(index))
+
+    def timed_out(*_args: Any, **_kwargs: Any) -> Any:
+        raise subprocess.TimeoutExpired("preview", 330, output=b"partial out\n",
+                                        stderr=b"partial err\n")
+
+    monkeypatch.setattr(engine.subprocess, "run", timed_out)
+    prior = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    receipt = engine.workflow_stage("preview", {}, index, index_path, prior)
+
+    assert receipt["status"] == "timeout"
+    assert receipt["direct_rc"] is None
+    assert Path(receipt["stdout_path"]).read_bytes() == b"partial out\n"
+    assert Path(receipt["stderr_path"]).read_bytes() == b"partial err\n"
+    assert json.loads(index_path.read_text())["stages"]["preview"]["status"] == "in_progress"
+
+
 def test_preview_selects_by_publication_time_and_does_not_mutate_source(tmp_path: Path) -> None:
     repos = make_repositories(tmp_path)
     releases = [

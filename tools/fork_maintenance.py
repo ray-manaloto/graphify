@@ -3332,14 +3332,25 @@ def workflow_stage(operation: str, fields: dict[str, str], index: dict[str, Any]
     index["stages"][operation] = {"status": "in_progress", "direct_rc": None,
                                   "evidence_dir": str(stage_dir)}
     workflow_save_index(index_path, index, prior_sha)
-    completed = subprocess.run(command, capture_output=True, timeout=DEFAULT_ATTEMPT_TIMEOUT + 30)
+    timed_out = False
+    try:
+        completed = subprocess.run(command, capture_output=True,
+                                   timeout=DEFAULT_ATTEMPT_TIMEOUT + 30)
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        completed = subprocess.CompletedProcess(command, None, exc.stdout or b"",
+                                                exc.stderr or b"")
     stdout_path, stderr_path = stage_dir / "stdout.raw", stage_dir / "stderr.raw"
     exclusive_write_bytes(stdout_path, completed.stdout)
     exclusive_write_bytes(stderr_path, completed.stderr)
-    try:
-        outcome = json.loads((completed.stdout if completed.returncode == 0 else completed.stderr).decode())
-    except (UnicodeError, json.JSONDecodeError):
-        outcome = {"status": "unparseable"}
+    if timed_out:
+        outcome = {"status": "timeout", "error": "outer workflow stage deadline elapsed",
+                   "stage_timeout_seconds": DEFAULT_ATTEMPT_TIMEOUT + 30}
+    else:
+        try:
+            outcome = json.loads((completed.stdout if completed.returncode == 0 else completed.stderr).decode())
+        except (UnicodeError, json.JSONDecodeError):
+            outcome = {"status": "unparseable"}
     return {"status": outcome.get("status"), "direct_rc": completed.returncode,
             "stdout_path": str(stdout_path), "stdout_sha256": sha256_bytes(completed.stdout),
             "stderr_path": str(stderr_path), "stderr_sha256": sha256_bytes(completed.stderr),
@@ -3355,12 +3366,22 @@ def workflow_replay_apply(index: dict[str, Any], index_path: Path,
         raise MaintenanceError("apply ownership or result is uncertain; refusing composite replay")
     command = [sys.executable, "-m", "tools.fork_maintenance", "apply",
                *workflow_arguments("apply", {**config, "expected_plan_sha256": pin})]
-    completed = subprocess.run(command, capture_output=True,
-                               timeout=DEFAULT_ATTEMPT_TIMEOUT + 30)
+    timed_out = False
     try:
-        response = json.loads((completed.stdout if completed.returncode == 0 else completed.stderr).decode())
-    except (UnicodeError, json.JSONDecodeError):
-        response = {"status": "unparseable"}
+        completed = subprocess.run(command, capture_output=True,
+                                   timeout=DEFAULT_ATTEMPT_TIMEOUT + 30)
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        completed = subprocess.CompletedProcess(command, None, exc.stdout or b"",
+                                                exc.stderr or b"")
+    if timed_out:
+        response = {"status": "timeout", "error": "outer workflow replay deadline elapsed",
+                    "stage_timeout_seconds": DEFAULT_ATTEMPT_TIMEOUT + 30}
+    else:
+        try:
+            response = json.loads((completed.stdout if completed.returncode == 0 else completed.stderr).decode())
+        except (UnicodeError, json.JSONDecodeError):
+            response = {"status": "unparseable"}
     if completed.returncode == 0 and response.get("status") == "replayed":
         return
     failure_dir = index_path.parent / f"{index['run_id']}-replay-failure"
