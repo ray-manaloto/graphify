@@ -7030,9 +7030,8 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     if extractor is None:
         return idx, {"nodes": [], "edges": []}
 
-    result = _safe_extract_with_xaml_root(
-        extractor, path, root, extra_excludes, gitignore,
-    )
+    ignore_args = () if extra_excludes is None and gitignore else (extra_excludes, gitignore)
+    result = _safe_extract_with_xaml_root(extractor, path, root, *ignore_args)
     # Never cache a zero-node result for an extractable file. Every supported
     # source produces at least a file node, so an empty node list is anomalous
     # (e.g. a transient batch/parallel hiccup). Caching it makes the empty
@@ -7253,9 +7252,8 @@ def _extract_sequential(
         markdown = path.suffix.lower() in _MD_LINKABLE_EXTS
         bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES or (markdown and md_fp is None)
         # XAML boundary anchors on `root` (the corpus), not the cache location.
-        result = _safe_extract_with_xaml_root(
-            extractor, path, root, extra_excludes, gitignore,
-        )
+        ignore_args = () if extra_excludes is None and gitignore else (extra_excludes, gitignore)
+        result = _safe_extract_with_xaml_root(extractor, path, root, *ignore_args)
         # See _extract_single_file: don't cache an anomalous zero-node result (#1666).
         if not bypass_cache and "error" not in result and result.get("nodes"):
             save_cached(
@@ -7458,9 +7456,13 @@ def extract(
             parallel = False
         ran_parallel = False
         if parallel and len(uncached_work) >= _PARALLEL_THRESHOLD:
+            ignore_args = (
+                () if extra_excludes is None and gitignore and md_fp is None
+                else (extra_excludes, gitignore, md_fp)
+            )
             ran_parallel = _extract_parallel(
                 uncached_work, per_file, root, max_workers, total, cache_location,
-                extra_excludes, gitignore, md_fp,
+                *ignore_args,
             )
         if not ran_parallel:
             # #2444: only re-extract what the pool didn't finish. A pool that
