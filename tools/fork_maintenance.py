@@ -3117,9 +3117,383 @@ class TerminalArgumentParser(argparse.ArgumentParser):
             write_terminal(message, stream=file if file is not None else sys.stderr, end="")
 
 
+WORKFLOW_SCHEMA_VERSION = 1
+PREVIEW_FIELDS = {
+    "source_repo": "--source-repo", "candidate": "--candidate",
+    "upstream_repository": "--upstream-repository", "upstream_url": "--upstream-url",
+    "output_plan": "--output-plan", "override_sha": "--override-sha",
+    "override_reason": "--override-reason", "github_releases_url": "--github-releases-url",
+    "pypi_base_url": "--pypi-base-url", "github_releases_fixture": "--github-releases-fixture",
+    "pypi_fixture": "--pypi-fixture",
+}
+APPLY_FIELDS = {
+    "plan": "--plan", "committer_name": "--committer-name",
+    "committer_email": "--committer-email", "source_repo": "--source-repo",
+    "upstream_url": "--upstream-url", "output_worktree": "--output-worktree",
+    "branch": "--branch", "evidence_dir": "--evidence-dir",
+}
+
+
+def workflow_config(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema_version") != WORKFLOW_SCHEMA_VERSION:
+        raise MaintenanceError("unsupported workflow configuration")
+    if set(value) - {"schema_version", "preview", "apply", "expected_plan_sha256", "qualification_sidecar"}:
+        raise MaintenanceError("unknown workflow configuration field")
+    apply = value.get("apply")
+    if not isinstance(apply, dict) or set(apply) != set(APPLY_FIELDS):
+        raise MaintenanceError("workflow apply inputs are incomplete or unknown")
+    preview = value.get("preview")
+    if preview is not None:
+        if not isinstance(preview, dict) or set(preview) - set(PREVIEW_FIELDS):
+            raise MaintenanceError("workflow preview inputs contain an unknown field")
+        if not {
+            "source_repo", "candidate", "upstream_repository", "upstream_url", "output_plan"
+        }.issubset(preview):
+            raise MaintenanceError("workflow preview inputs are incomplete")
+    for part in (apply, preview or {}):
+        if any(not isinstance(v, str) or not v for v in part.values()):
+            raise MaintenanceError("workflow arguments must be nonempty strings")
+    if preview:
+        if Path(preview["output_plan"]).resolve() != Path(apply["plan"]).resolve():
+            raise MaintenanceError("preview output and apply plan differ")
+        if Path(preview["source_repo"]).resolve() != Path(apply["source_repo"]).resolve():
+            raise MaintenanceError("preview and apply source repositories differ")
+        if preview["upstream_url"] != apply["upstream_url"]:
+            raise MaintenanceError("preview and apply upstream URLs differ")
+    validate_upstream_url(apply["upstream_url"])
+    if preview:
+        validate_upstream_url(preview["upstream_url"])
+        if "github_releases_url" in preview:
+            parsed_admitted_metadata_url(preview["github_releases_url"], "GitHub releases endpoint")
+        if "pypi_base_url" in preview:
+            parsed_admitted_metadata_url(preview["pypi_base_url"], "PyPI base URL", allow_query=False)
+        if not Path(preview["source_repo"]).is_absolute() or not Path(preview["output_plan"]).is_absolute():
+            raise MaintenanceError("workflow preview paths must be absolute")
+    for key in ("plan", "source_repo", "output_worktree", "evidence_dir"):
+        if not Path(apply[key]).is_absolute():
+            raise MaintenanceError(f"workflow {key} must be absolute")
+    pin = value.get("expected_plan_sha256")
+    if pin is not None and (not isinstance(pin, str) or not DIGEST_RE.fullmatch(pin)):
+        raise MaintenanceError("workflow plan pin is invalid")
+    sidecar = value.get("qualification_sidecar")
+    if sidecar is not None and (not isinstance(sidecar, str) or not Path(sidecar).is_absolute()):
+        raise MaintenanceError("qualification sidecar path must be absolute")
+    return value
+
+
+def workflow_arguments(operation: str, fields: dict[str, str]) -> list[str]:
+    allowed = PREVIEW_FIELDS if operation == "preview" else APPLY_FIELDS
+    arguments = [item for key, value in fields.items() if key in allowed
+                 for item in (allowed[key], value)]
+    if operation == "apply":
+        arguments.extend(("--expected-plan-sha256", fields["expected_plan_sha256"]))
+    return arguments
+
+
+def workflow_project(index: dict[str, Any], observed_plan_exists: bool | None) -> dict[str, Any]:
+    stages = index.get("stages", {})
+    if not isinstance(stages, dict):
+        raise MaintenanceError("workflow stages are malformed")
+    if index.get("replay_failure"):
+        return {"status": "stopped", "next_action": "inspect_replay_failure",
+                "stopped_reason": "replay_refused"}
+    for stage in ("preview", "apply"):
+        receipt = stages.get(stage)
+        if receipt is not None and (not isinstance(receipt, dict) or receipt.get("status") not in
+                                    ({"planned"} if stage == "preview" else {"applied", "replayed"})):
+            return {"status": "stopped", "next_action": "inspect_failed_stage", "stopped_reason": stage}
+    if "apply" in stages:
+        if index.get("qualification_sidecar_sha256"):
+            return {"status": "stopped", "next_action": "await_fork_gates",
+                    "stopped_reason": "downstream_qualification_not_automated"}
+        return {"status": "stopped", "next_action": "qualify_capabilities",
+                "stopped_reason": "ticket788_sidecar_required"}
+    if "preview" in stages or observed_plan_exists is True:
+        return {"status": "stopped", "next_action": "supply_external_plan_pin",
+                "stopped_reason": "exact_byte_plan_pin_required"}
+    if observed_plan_exists is None:
+        return {"status": "stopped", "next_action": "inspect_plan_visibility",
+                "stopped_reason": "plan_visibility_unknown"}
+    return {"status": "ready", "next_action": "preview", "stopped_reason": None}
+
+
+def workflow_load_index(path: Path, run_id: str) -> dict[str, Any]:
+    try:
+        content = path.read_bytes()
+        index = json.loads(content)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise MaintenanceError(f"cannot read workflow index: {exc}") from exc
+    if not isinstance(index, dict) or index.get("schema_version") != WORKFLOW_SCHEMA_VERSION:
+        raise MaintenanceError("workflow index schema is invalid")
+    unsigned = dict(index)
+    observed_integrity = unsigned.pop("integrity", None)
+    if (not isinstance(observed_integrity, dict) or
+            observed_integrity.get("algorithm") != "sha256" or
+            observed_integrity.get("sha256") != sha256_bytes(canonical_json(unsigned))):
+        raise MaintenanceError("workflow index integrity check failed")
+    if index.get("run_id") != run_id:
+        raise MaintenanceError("workflow run identity mismatch")
+    if (not isinstance(index.get("config_path"), str) or
+            not Path(index["config_path"]).is_absolute() or
+            not isinstance(index.get("stages"), dict) or
+            not isinstance(index.get("target_attempts"), list)):
+        raise MaintenanceError("workflow index structure is invalid")
+    config = workflow_config(index.get("config"))
+    if index.get("immutable_config_sha256") != sha256_bytes(canonical_json(config)):
+        raise MaintenanceError("workflow configuration identity drift")
+    config_path = Path(index["config_path"])
+    try:
+        current_config = config_path.read_bytes()
+    except OSError as exc:
+        raise MaintenanceError(f"workflow configuration unavailable: {exc}") from exc
+    if sha256_bytes(current_config) != index.get("config_file_sha256"):
+        raise MaintenanceError("workflow configuration file drift")
+    return index
+
+
+def workflow_index_bytes(index: dict[str, Any]) -> bytes:
+    unsigned = dict(index)
+    unsigned.pop("integrity", None)
+    index["integrity"] = {"algorithm": "sha256", "sha256": sha256_bytes(canonical_json(unsigned))}
+    return json_file_bytes(index)
+
+
+def workflow_validate_sidecar(index: dict[str, Any], plan: dict[str, Any]) -> str:
+    sidecar_name = index["config"].get("qualification_sidecar")
+    if not sidecar_name:
+        raise MaintenanceError("ticket788 qualification sidecar is not configured")
+    sidecar_path = Path(sidecar_name)
+    content = sidecar_path.read_bytes()
+    sidecar = json.loads(content)
+    if not isinstance(sidecar, dict) or set(sidecar) != {
+        "schema_version", "ticket", "plan_sha256", "result_commit", "result_tree",
+        "capabilities", "evidence_refs"
+    } or sidecar["schema_version"] != 1 or sidecar["ticket"] != 788:
+        raise MaintenanceError("ticket788 sidecar schema is incomplete")
+    result = read_result(Path(index["config"]["apply"]["evidence_dir"]) / "result.json")
+    if (result.get("status") != "applied" or
+            sidecar["plan_sha256"] != index["plan_sha256"] or
+            sidecar["result_commit"] != result.get("result_commit") or
+            sidecar["result_tree"] != result.get("result_tree")):
+        raise MaintenanceError("ticket788 sidecar does not bind exact plan and output")
+    items = sidecar["capabilities"]
+    manifest = plan["capability_manifest"]
+    if not isinstance(items, list) or len(items) != len(manifest):
+        raise MaintenanceError("ticket788 sidecar capability coverage is incomplete")
+    expected = {(item["path"], item["status"]) for item in manifest}
+    observed: set[tuple[str, str]] = set()
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {
+            "path", "status", "classification", "rationale", "evidence_refs"
+        }:
+            raise MaintenanceError("ticket788 capability entry is malformed")
+        identity = (item["path"], item["status"])
+        if identity in observed or identity not in expected:
+            raise MaintenanceError("ticket788 capability identity is missing or duplicated")
+        observed.add(identity)
+        if item["classification"] not in {"retained", "equivalent", "superseded", "user-excluded"}:
+            raise MaintenanceError("ticket788 capability classification is unknown")
+        if (not isinstance(item["rationale"], str) or not item["rationale"].strip() or
+                not isinstance(item["evidence_refs"], list) or not item["evidence_refs"] or
+                any(not isinstance(ref, str) or not ref for ref in item["evidence_refs"])):
+            raise MaintenanceError("ticket788 capability has no evidence")
+    if (observed != expected or not isinstance(sidecar["evidence_refs"], list) or
+            not sidecar["evidence_refs"] or any(
+                not isinstance(ref, str) or not ref for ref in sidecar["evidence_refs"]
+            )):
+        raise MaintenanceError("ticket788 sidecar evidence is incomplete")
+    return sha256_bytes(content)
+
+
+def workflow_save_index(path: Path, index: dict[str, Any], prior_sha: str) -> None:
+    # This is the sole mutable workflow record. Immutable plans and receipts retain
+    # their exclusive-publication semantics.
+    if sha256_bytes(path.read_bytes()) != prior_sha:
+        raise MaintenanceError("workflow index changed concurrently")
+    payload = workflow_index_bytes(index)
+    fd, temporary = tempfile.mkstemp(prefix=".workflow-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def workflow_stage(operation: str, fields: dict[str, str], index: dict[str, Any],
+                   index_path: Path, prior_sha: str) -> dict[str, Any]:
+    command = [sys.executable, "-m", "tools.fork_maintenance", operation,
+               *workflow_arguments(operation, fields)]
+    stage_dir = index_path.parent / f"{index['run_id']}-{operation}"
+    stage_dir.mkdir(mode=0o700, exist_ok=False)
+    index["stages"][operation] = {"status": "in_progress", "direct_rc": None,
+                                  "evidence_dir": str(stage_dir)}
+    workflow_save_index(index_path, index, prior_sha)
+    completed = subprocess.run(command, capture_output=True, timeout=DEFAULT_ATTEMPT_TIMEOUT + 30)
+    stdout_path, stderr_path = stage_dir / "stdout.raw", stage_dir / "stderr.raw"
+    exclusive_write_bytes(stdout_path, completed.stdout)
+    exclusive_write_bytes(stderr_path, completed.stderr)
+    try:
+        outcome = json.loads((completed.stdout if completed.returncode == 0 else completed.stderr).decode())
+    except (UnicodeError, json.JSONDecodeError):
+        outcome = {"status": "unparseable"}
+    return {"status": outcome.get("status"), "direct_rc": completed.returncode,
+            "stdout_path": str(stdout_path), "stdout_sha256": sha256_bytes(completed.stdout),
+            "stderr_path": str(stderr_path), "stderr_sha256": sha256_bytes(completed.stderr),
+            "outcome": outcome}
+
+
+def workflow_replay_apply(index: dict[str, Any], index_path: Path,
+                          pin: str, prior_sha: str) -> None:
+    config = index["config"]["apply"]
+    result_path = Path(config["evidence_dir"]) / "result.json"
+    lock_path = Path(config["evidence_dir"]) / "attempt.lock"
+    if os.path.lexists(lock_path) or not result_path.is_file():
+        raise MaintenanceError("apply ownership or result is uncertain; refusing composite replay")
+    command = [sys.executable, "-m", "tools.fork_maintenance", "apply",
+               *workflow_arguments("apply", {**config, "expected_plan_sha256": pin})]
+    completed = subprocess.run(command, capture_output=True,
+                               timeout=DEFAULT_ATTEMPT_TIMEOUT + 30)
+    try:
+        response = json.loads((completed.stdout if completed.returncode == 0 else completed.stderr).decode())
+    except (UnicodeError, json.JSONDecodeError):
+        response = {"status": "unparseable"}
+    if completed.returncode == 0 and response.get("status") == "replayed":
+        return
+    failure_dir = index_path.parent / f"{index['run_id']}-replay-failure"
+    failure_dir.mkdir(mode=0o700, exist_ok=False)
+    stdout_path, stderr_path = failure_dir / "stdout.raw", failure_dir / "stderr.raw"
+    exclusive_write_bytes(stdout_path, completed.stdout)
+    exclusive_write_bytes(stderr_path, completed.stderr)
+    index["replay_failure"] = {
+        "direct_rc": completed.returncode, "outcome": response,
+        "stdout_path": str(stdout_path), "stdout_sha256": sha256_bytes(completed.stdout),
+        "stderr_path": str(stderr_path), "stderr_sha256": sha256_bytes(completed.stderr),
+    }
+    workflow_save_index(index_path, index, prior_sha)
+    raise MaintenanceError("apply replay refused; retained raw evidence requires inspection")
+
+
+def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    index_path = Path(args.evidence_index).resolve()
+    if args.operation == "run":
+        config_path = Path(args.workflow_config).resolve(strict=True)
+        config_bytes = config_path.read_bytes()
+        config = workflow_config(json.loads(config_bytes))
+        run_id = sha256_bytes(canonical_json({"config": config, "path": str(config_path)}))
+        if os.path.lexists(index_path):
+            raise MaintenanceError("workflow index already exists; use resume")
+        plan_path = Path(config["apply"]["plan"])
+        pin = config.get("expected_plan_sha256")
+        if plan_path.exists() and pin:
+            load_and_validate_plan(plan_path, pin)
+        if not plan_path.exists() and "preview" not in config:
+            raise MaintenanceError("plan absent and preview inputs unavailable")
+        index = {"schema_version": WORKFLOW_SCHEMA_VERSION, "run_id": run_id,
+                 "config": config, "config_path": str(config_path),
+                 "config_file_sha256": sha256_bytes(config_bytes),
+                 "immutable_config_sha256": sha256_bytes(canonical_json(config)),
+                 "stages": {}, "target_attempts": []}
+        exclusive_write_bytes(index_path, workflow_index_bytes(index))
+    else:
+        run_id = args.run_id
+        index = workflow_load_index(index_path, run_id)
+        config = index["config"]
+    if args.operation == "status":
+        plan_path = Path(config["apply"]["plan"])
+        observed = plan_path.exists()
+        if index.get("plan_sha256") and (
+            not observed or sha256_bytes(plan_path.read_bytes()) != index["plan_sha256"]
+        ):
+            return {"run_id": run_id, "status": "stopped",
+                    "next_action": "inspect_plan_drift", "stopped_reason": "plan_pin_drift",
+                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+        sidecar_name = config.get("qualification_sidecar")
+        if index.get("qualification_sidecar_sha256") and (
+            not sidecar_name or not Path(sidecar_name).exists() or
+            sha256_bytes(Path(sidecar_name).read_bytes()) != index["qualification_sidecar_sha256"]
+        ):
+            return {"run_id": run_id, "status": "stopped",
+                    "next_action": "inspect_sidecar_drift", "stopped_reason": "sidecar_drift",
+                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+        if os.path.lexists(Path(config["apply"]["evidence_dir"]) / "attempt.lock"):
+            return {"run_id": run_id, "status": "stopped",
+                    "next_action": "inspect_retained_lock", "stopped_reason": "apply_ownership_uncertain",
+                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+        return {"run_id": run_id, **workflow_project(index, observed), "stages": index["stages"],
+                "target_attempts": index["target_attempts"]}, 0
+    lock = Path(str(index_path) + ".lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise MaintenanceError("workflow ownership lock remains present") from exc
+    os.close(fd)
+    try:
+        prior_sha = sha256_bytes(index_path.read_bytes())
+        stages = index["stages"]
+        plan_path = Path(config["apply"]["plan"])
+        if any(stage in stages and (
+            stages[stage].get("direct_rc") != 0 or
+            stages[stage].get("status") not in (
+                {"planned"} if stage == "preview" else {"applied", "replayed"}
+            )
+        ) for stage in ("preview", "apply")):
+            return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
+        if index.get("replay_failure"):
+            return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
+        if not plan_path.exists() and "preview" not in stages:
+            if "preview" not in config:
+                raise MaintenanceError("plan absent and preview inputs unavailable")
+            receipt = workflow_stage("preview", config["preview"], index, index_path,
+                                     prior_sha)
+            stages["preview"] = receipt
+            workflow_save_index(index_path, index, sha256_bytes(index_path.read_bytes()))
+            prior_sha = sha256_bytes(index_path.read_bytes())
+            if receipt["direct_rc"] != 0 or receipt["status"] != "planned":
+                return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
+        pin = getattr(args, "expected_plan_sha256", None) or config.get("expected_plan_sha256")
+        if (getattr(args, "expected_plan_sha256", None) and config.get("expected_plan_sha256")
+                and args.expected_plan_sha256 != config["expected_plan_sha256"]):
+            raise MaintenanceError("resume pin differs from immutable workflow configuration")
+        if not pin:
+            return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
+        if not DIGEST_RE.fullmatch(pin):
+            raise MaintenanceError("external plan pin is invalid")
+        plan, observed_pin = load_and_validate_plan(plan_path, pin)
+        if index.get("plan_sha256") not in (None, observed_pin):
+            raise MaintenanceError("workflow plan pin changed")
+        index["plan_sha256"] = observed_pin
+        if not index["target_attempts"]:
+            index["target_attempts"].append({"target_commit": plan["selection"]["target_commit"],
+                                             "plan_sha256": observed_pin})
+        if "apply" not in stages:
+            receipt = workflow_stage("apply", {**config["apply"],
+                "expected_plan_sha256": observed_pin}, index, index_path, prior_sha)
+            stages["apply"] = receipt
+            workflow_save_index(index_path, index, sha256_bytes(index_path.read_bytes()))
+            if receipt["direct_rc"] != 0 or receipt["status"] not in {"applied", "replayed"}:
+                return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
+            prior_sha = sha256_bytes(index_path.read_bytes())
+        else:
+            workflow_replay_apply(index, index_path, observed_pin, prior_sha)
+        if index.get("qualification_sidecar_sha256"):
+            current = workflow_validate_sidecar(index, plan)
+            if current != index["qualification_sidecar_sha256"]:
+                raise MaintenanceError("ticket788 sidecar identity drift")
+        elif config.get("qualification_sidecar") and Path(config["qualification_sidecar"]).exists():
+            index["qualification_sidecar_sha256"] = workflow_validate_sidecar(index, plan)
+            workflow_save_index(index_path, index, prior_sha)
+        return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
+    finally:
+        os.unlink(lock)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = TerminalArgumentParser(
-        description="Preview or apply a frozen Graphify fork-maintenance plan."
+        description="Preview, apply, or inspect a bounded Graphify fork-maintenance workflow."
     )
     subparsers = parser.add_subparsers(dest="operation", required=True)
     preview_parser = subparsers.add_parser(
@@ -3154,6 +3528,17 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument("--branch", required=True)
     apply_parser.add_argument("--evidence-dir", required=True)
     add_shared_limits(apply_parser)
+    run_parser = subparsers.add_parser("run", help="start a bounded fork-maintenance workflow")
+    run_parser.add_argument("--workflow-config", required=True)
+    run_parser.add_argument("--evidence-index", required=True)
+    resume_parser = subparsers.add_parser("resume", help="continue a stopped workflow")
+    resume_parser.add_argument("--evidence-index", required=True)
+    resume_parser.add_argument("--run-id", required=True)
+    resume_parser.add_argument("--expected-plan-sha256")
+    status_parser = subparsers.add_parser("status", help="read a workflow projection")
+    status_parser.add_argument("--evidence-index", required=True)
+    status_parser.add_argument("--run-id", required=True)
+    status_parser.add_argument("--json", action="store_true")
     return parser
 
 
@@ -3168,6 +3553,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = build_parser().parse_args(argv)
     except TerminalTransportError:
         return EXIT_REFUSED
+    if args.operation in {"run", "resume", "status"}:
+        try:
+            outcome, code = workflow_execute(args)
+        except (MaintenanceError, OSError, UnicodeError, json.JSONDecodeError,
+                subprocess.SubprocessError) as exc:
+            outcome = {"status": "refused", "error": str(exc)}
+            code = EXIT_REFUSED
+        try:
+            write_terminal(json.dumps(outcome, sort_keys=True),
+                           stream=sys.stdout if code == 0 else sys.stderr)
+        except TerminalTransportError:
+            return EXIT_REFUSED
+        return code
     installed: dict[int, Any] = {}
     controller = CatchableSignalController()
     SIGNAL_CONTROLLER = controller

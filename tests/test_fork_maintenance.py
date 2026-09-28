@@ -202,13 +202,163 @@ def apply_args(
     )
 
 
-def test_help_exposes_only_explicit_preview_and_apply_operations() -> None:
+def test_help_exposes_preview_apply_and_bounded_workflow_operations() -> None:
     result = run_cli("--help")
 
     assert result.returncode == 0
     assert "preview" in result.stdout
     assert "apply" in result.stdout
+    assert "run" in result.stdout
+    assert "resume" in result.stdout
+    assert "status" in result.stdout
     assert "frozen" in result.stdout.lower()
+
+
+def workflow_fixture(repos: dict[str, Any], tmp_path: Path, plan: Path,
+                     pin: str | None) -> tuple[Path, Path, Path, Path]:
+    output = tmp_path / "workflow-output"
+    evidence = tmp_path / "workflow-evidence"
+    config_path = tmp_path / "workflow-config.json"
+    index_path = tmp_path / "workflow-index.json"
+    config: dict[str, Any] = {
+        "schema_version": 1,
+        "apply": {
+            "plan": str(plan), "committer_name": "Maintenance Fixture",
+            "committer_email": "maintenance-fixture@example.invalid",
+            "source_repo": str(repos["source"]), "upstream_url": str(repos["upstream"]),
+            "output_worktree": str(output), "branch": "codex/workflow-fixture",
+            "evidence_dir": str(evidence),
+        },
+    }
+    if pin is not None:
+        config["expected_plan_sha256"] = pin
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    return config_path, index_path, output, evidence
+
+
+def test_workflow_requires_external_pin_before_any_apply_mutation(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    (repos["source"] / "shared.txt").write_text("dirty but frozen\n", encoding="utf-8")
+    plan = tmp_path / "plan.json"
+    assert preview_override(repos, plan).returncode == 0
+    config, index, output, evidence = workflow_fixture(repos, tmp_path, plan, None)
+    before = source_fingerprint(repos["source"])
+
+    started = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+
+    assert started.returncode != 0
+    assert json.loads(started.stderr)["next_action"] == "supply_external_plan_pin"
+    assert not output.exists()
+    assert not evidence.exists()
+    assert source_fingerprint(repos["source"]) == before
+    run_id = json.loads(index.read_text())["run_id"]
+    pin = hashlib.sha256(plan.read_bytes()).hexdigest()
+    resumed = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id,
+                      "--expected-plan-sha256", pin)
+    assert resumed.returncode != 0
+    assert json.loads(resumed.stderr)["next_action"] == "qualify_capabilities"
+    assert output.is_dir()
+    assert json.loads((evidence / "result.json").read_text())["status"] == "applied"
+    index_before = index.read_bytes()
+    result_before = (evidence / "result.json").read_bytes()
+    status = run_cli("status", "--evidence-index", str(index), "--run-id", run_id, "--json")
+    assert status.returncode == 0
+    assert json.loads(status.stdout)["next_action"] == "qualify_capabilities"
+    assert index.read_bytes() == index_before
+    again = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id,
+                    "--expected-plan-sha256", pin)
+    assert again.returncode != 0
+    assert (evidence / "result.json").read_bytes() == result_before
+    assert index.read_bytes() == index_before
+    retained_lock = evidence / "attempt.lock"
+    retained_lock.write_text("incomplete owner", encoding="utf-8")
+    blocked = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id,
+                      "--expected-plan-sha256", pin)
+    assert blocked.returncode == 2
+    assert "ownership or result is uncertain" in json.loads(blocked.stderr)["error"]
+    assert index.read_bytes() == index_before
+
+
+def test_workflow_wrong_pin_refuses_before_apply(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    plan = tmp_path / "plan.json"
+    assert preview_override(repos, plan).returncode == 0
+    config, index, output, evidence = workflow_fixture(repos, tmp_path, plan, "0" * 64)
+    before = source_fingerprint(repos["source"])
+    failed = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert failed.returncode == 2
+    assert not index.exists()
+    assert not output.exists()
+    assert not evidence.exists()
+    assert source_fingerprint(repos["source"]) == before
+
+
+def test_workflow_sidecar_requires_complete_exact_output_binding(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    plan = tmp_path / "plan.json"
+    assert preview_override(repos, plan).returncode == 0
+    pin = hashlib.sha256(plan.read_bytes()).hexdigest()
+    config, index, output, evidence = workflow_fixture(repos, tmp_path, plan, pin)
+    sidecar = tmp_path / "ticket788.json"
+    config_data = json.loads(config.read_text())
+    config_data["qualification_sidecar"] = str(sidecar)
+    config.write_text(json.dumps(config_data), encoding="utf-8")
+    started = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert started.returncode != 0
+    assert json.loads(started.stderr)["next_action"] == "qualify_capabilities"
+    run_id = json.loads(index.read_text())["run_id"]
+    result = json.loads((evidence / "result.json").read_text())
+    manifest = json.loads(plan.read_text())["capability_manifest"]
+    payload = {
+        "schema_version": 1, "ticket": 788, "plan_sha256": pin,
+        "result_commit": repos["candidate"], "result_tree": result["result_tree"],
+        "capabilities": [
+            {"path": row["path"], "status": row["status"],
+             "classification": "retained", "rationale": "fixture evidence",
+             "evidence_refs": ["fixture://case"]}
+            for row in manifest
+        ], "evidence_refs": ["fixture://case"],
+    }
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    bad = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
+    assert bad.returncode == 2
+    assert "does not bind exact plan and output" in json.loads(bad.stderr)["error"]
+    assert not json.loads(index.read_text()).get("qualification_sidecar_sha256")
+    payload["result_commit"] = result["result_commit"]
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    accepted = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
+    assert accepted.returncode != 0
+    assert json.loads(accepted.stderr)["next_action"] == "await_fork_gates"
+    assert json.loads(index.read_text())["qualification_sidecar_sha256"] == hashlib.sha256(
+        sidecar.read_bytes()).hexdigest()
+    before_status = index.read_bytes()
+    payload["evidence_refs"] = ["fixture://changed"]
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    stale = run_cli("status", "--evidence-index", str(index), "--run-id", run_id)
+    assert stale.returncode == 0
+    assert json.loads(stale.stdout)["next_action"] == "inspect_sidecar_drift"
+    assert index.read_bytes() == before_status
+
+
+def test_workflow_index_tamper_refuses_without_apply(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    plan = tmp_path / "plan.json"
+    assert preview_override(repos, plan).returncode == 0
+    config, index, output, evidence = workflow_fixture(repos, tmp_path, plan, None)
+    started = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert started.returncode != 0
+    payload = json.loads(index.read_text())
+    run_id = payload["run_id"]
+    payload["stages"]["apply"] = {"status": "applied", "direct_rc": 0}
+    index.write_text(json.dumps(payload), encoding="utf-8")
+
+    refused = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id,
+                      "--expected-plan-sha256", hashlib.sha256(plan.read_bytes()).hexdigest())
+
+    assert refused.returncode == 2
+    assert "integrity check failed" in json.loads(refused.stderr)["error"]
+    assert not output.exists()
+    assert not evidence.exists()
 
 
 def test_preview_selects_by_publication_time_and_does_not_mutate_source(tmp_path: Path) -> None:

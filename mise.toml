@@ -1,5 +1,5 @@
 [tasks.fork-maintenance]
-description = "Preview or apply a frozen Graphify fork-maintenance plan"
+description = "Preview, apply, or inspect a bounded Graphify fork-maintenance workflow"
 quiet = true
 usage = 'arg "[args]" var=#true help="Arguments forwarded verbatim to tools.fork_maintenance"'
 raw_args = true
