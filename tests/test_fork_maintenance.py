@@ -593,6 +593,75 @@ def test_workflow_requires_external_pin_before_any_apply_mutation(tmp_path: Path
     assert index.read_bytes() == index_before
 
 
+def test_workflow_prewrite_admission_refuses_source_and_plan_aliases(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    before = source_fingerprint(repos["source"])
+    plan = repos["source"] / "plan.json"
+    config, _, output, evidence = workflow_fixture(repos, tmp_path, plan, None)
+    payload = json.loads(config.read_text())
+    payload["preview"] = {
+        "source_repo": str(repos["source"]), "candidate": repos["candidate"],
+        "upstream_repository": "Graphify-Labs/graphify", "upstream_url": str(repos["upstream"]),
+        "output_plan": str(plan), "override_sha": repos["target"],
+        "override_reason": "fixture target",
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    aliased = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(plan))
+    assert aliased.returncode == 2
+    assert "overlaps" in json.loads(aliased.stderr)["error"]
+    assert not plan.exists() and not output.exists() and not evidence.exists()
+    assert source_fingerprint(repos["source"]) == before
+    external_plan = tmp_path / "external-plan.json"
+    payload["preview"]["output_plan"] = str(external_plan)
+    payload["apply"]["plan"] = str(external_plan)
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    index = repos["source"] / "index.json"
+    refused = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert refused.returncode == 2
+    assert "overlaps" in json.loads(refused.stderr)["error"]
+    assert not index.exists() and not external_plan.exists()
+    assert not list(repos["source"].glob("*-preview"))
+    assert source_fingerprint(repos["source"]) == before
+    source_alias = tmp_path / "source-alias"
+    source_alias.symlink_to(repos["source"], target_is_directory=True)
+    alias_index = source_alias / "alias-index.json"
+    alias_refused = run_cli("run", "--workflow-config", str(config),
+                            "--evidence-index", str(alias_index))
+    assert alias_refused.returncode == 2
+    assert "overlaps" in json.loads(alias_refused.stderr)["error"]
+    assert not (repos["source"] / "alias-index.json").exists()
+    payload["apply"]["output_worktree"] = str(source_alias / "output")
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    external_index = tmp_path / "external-index.json"
+    output_refused = run_cli("run", "--workflow-config", str(config),
+                             "--evidence-index", str(external_index))
+    assert output_refused.returncode == 2
+    assert "overlaps" in json.loads(output_refused.stderr)["error"]
+    assert not external_index.exists() and not (repos["source"] / "output").exists()
+    assert source_fingerprint(repos["source"]) == before
+
+
+def test_currency_refuses_drifted_output_without_current_receipt(tmp_path: Path) -> None:
+    for drift in ("head", "dirty"):
+        case = tmp_path / drift
+        case.mkdir()
+        repos = make_repositories(case)
+        index, _, _, _ = release_workflow(repos, case)
+        state = json.loads(index.read_text())
+        output = Path(state["config"]["apply"]["output_worktree"])
+        if drift == "head":
+            git(output, "checkout", "--detach", repos["base"])
+        else:
+            (output / "changed.txt").write_text("dirty output", encoding="utf-8")
+        subject, pin = currency_subject(index, case, "publication")
+        refused = currency_call(index, subject, pin, "publication")
+        assert refused.returncode == 2
+        current = json.loads(index.read_text())
+        assert current.get("replay_failure")
+        assert not current.get("currency_observations")
+        assert not list(case.glob(f"{state['run_id']}-currency-*.json"))
+
+
 def test_workflow_wrong_pin_refuses_before_apply(tmp_path: Path) -> None:
     repos = make_repositories(tmp_path)
     plan = tmp_path / "plan.json"
@@ -793,27 +862,112 @@ def test_workflow_index_tamper_refuses_without_apply(tmp_path: Path) -> None:
     assert not evidence.exists()
 
 
-def test_workflow_outer_stage_timeout_keeps_captured_raw_bytes(
+def test_workflow_outer_stage_and_replay_settle_real_descendant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine = load_engine()
     index_path = tmp_path / "index.json"
     index: dict[str, Any] = {"run_id": "fixture-run", "stages": {}}
     index_path.write_bytes(engine.workflow_index_bytes(index))
-
-    def timed_out(*_args: Any, **_kwargs: Any) -> Any:
-        raise subprocess.TimeoutExpired("preview", 330, output=b"partial out\n",
-                                        stderr=b"partial err\n")
-
-    monkeypatch.setattr(engine.subprocess, "run", timed_out)
+    sentinel = tmp_path / "late-sentinel"
+    child = (
+        "import pathlib,signal,sys,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "time.sleep(1.5); pathlib.Path(sys.argv[1]).write_text('late')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{child!r},sys.argv[1]]); "
+        "print('partial out',flush=True); print('partial err',file=sys.stderr,flush=True); "
+        "time.sleep(20)"
+    )
+    real_supervise = engine.workflow_supervise
+    monkeypatch.setattr(engine, "workflow_supervise", lambda _command: real_supervise(
+        [sys.executable, "-c", parent, str(sentinel)], timeout=0.3))
     prior = hashlib.sha256(index_path.read_bytes()).hexdigest()
     receipt = engine.workflow_stage("preview", {}, index, index_path, prior)
-
     assert receipt["status"] == "timeout"
-    assert receipt["direct_rc"] is None
+    assert receipt["direct_rc"] is not None
     assert Path(receipt["stdout_path"]).read_bytes() == b"partial out\n"
     assert Path(receipt["stderr_path"]).read_bytes() == b"partial err\n"
+    assert receipt["settlement"]["stdout_eof"] is True
+    assert receipt["settlement"]["process_group_settled"] is True
+    assert receipt["settlement"]["process_group_absent_after_shutdown"] is True
     assert json.loads(index_path.read_text())["stages"]["preview"]["status"] == "in_progress"
+    replay_index_path = tmp_path / "replay-index.json"
+    replay_evidence = tmp_path / "replay-evidence"
+    replay_evidence.mkdir()
+    (replay_evidence / "result.json").write_text("{}", encoding="utf-8")
+    replay_index = {"run_id": "replay-run", "stages": {}, "config": {"apply": {
+        "evidence_dir": str(replay_evidence),
+    }}}
+    replay_index_path.write_bytes(engine.workflow_index_bytes(replay_index))
+    with pytest.raises(engine.MaintenanceError, match="replay refused"):
+        engine.workflow_replay_apply(replay_index, replay_index_path, "0" * 64,
+                                     hashlib.sha256(replay_index_path.read_bytes()).hexdigest())
+    replay_receipt = json.loads(replay_index_path.read_text())["replay_failure"]
+    assert replay_receipt["outcome"]["status"] == "timeout"
+    assert Path(replay_receipt["stdout_path"]).read_bytes() == b"partial out\n"
+    assert Path(replay_receipt["stderr_path"]).read_bytes() == b"partial err\n"
+    assert replay_receipt["settlement"]["process_group_absent_after_shutdown"] is True
+    time.sleep(1.6)
+    assert not sentinel.exists()
+
+
+def test_workflow_outer_escaped_pipe_holder_is_bounded_unknown(tmp_path: Path) -> None:
+    engine = load_engine()
+    sentinel = tmp_path / "escaped-sentinel"
+    child = "import pathlib,sys,time; time.sleep(15); pathlib.Path(sys.argv[1]).write_text('late')"
+    parent = (
+        "import subprocess,sys,time; "
+        f"p=subprocess.Popen([sys.executable,'-c',{child!r},sys.argv[1]],start_new_session=True); "
+        "print(p.pid,flush=True); time.sleep(20)"
+    )
+    started = time.monotonic()
+    receipt = engine.workflow_supervise([sys.executable, "-c", parent, str(sentinel)], timeout=0.3)
+    elapsed = time.monotonic() - started
+    escaped_pid = int(receipt["stdout"].splitlines()[0])
+    try:
+        assert elapsed < engine.SHUTDOWN_ALLOWANCE_SECONDS + 3
+        assert receipt["timed_out"] is True
+        assert receipt["stdout_eof"] is False
+        assert receipt["raw_complete"] is False
+        assert receipt["process_group_settled"] is True
+        assert receipt["process_group_absent_after_shutdown"] is True
+    finally:
+        os.kill(escaped_pid, signal.SIGKILL)
+    assert not sentinel.exists()
+
+
+def test_workflow_outer_interruption_settles_descendant(tmp_path: Path) -> None:
+    sentinel = tmp_path / "interrupted-sentinel"
+    descendant = (
+        "import pathlib,signal,sys,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "time.sleep(1.5); pathlib.Path(sys.argv[1]).write_text('late')"
+    )
+    stage = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{descendant!r},sys.argv[1]]); "
+        "print('stage-started',flush=True); time.sleep(20)"
+    )
+    outer = (
+        "import json,sys; from tools import fork_maintenance as m; "
+        f"r=m.workflow_supervise([sys.executable,'-c',{stage!r},sys.argv[1]],timeout=10); "
+        "r.pop('stdout'); r.pop('stderr'); print(json.dumps(r),flush=True)"
+    )
+    process = subprocess.Popen([sys.executable, "-c", outer, str(sentinel)], cwd=ROOT,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    os.kill(process.pid, signal.SIGTERM)
+    stdout, stderr = process.communicate(timeout=8)
+    assert process.returncode == 0, stderr
+    receipt = json.loads(stdout)
+    assert receipt["interrupted"] == "SIGTERM"
+    assert receipt["process_group_settled"] is True
+    assert receipt["process_group_absent_after_shutdown"] is True
+    time.sleep(1.6)
+    assert not sentinel.exists()
 
 
 def test_preview_selects_by_publication_time_and_does_not_mutate_source(tmp_path: Path) -> None:

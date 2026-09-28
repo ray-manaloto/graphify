@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import selectors
 import shutil
 import signal
 import stat
@@ -3210,6 +3211,44 @@ def workflow_fixture_bindings(config: dict[str, Any]) -> dict[str, dict[str, str
     return bindings
 
 
+def workflow_admit_paths(config: dict[str, Any], index_path: Path,
+                         config_path: Path, run_id: str,
+                         currency_ordinal: int = 1) -> None:
+    """Reject composite path aliases before publishing an index or stage directory."""
+    apply = config["apply"]
+    source = Path(apply["source_repo"]).resolve(strict=True)
+    with terminal_scratch("graphify-fork-admit-") as scratch:
+        home = Path(scratch.path) / "home"
+        home.mkdir()
+        runner = GitRunner(subprocess_timeout=DEFAULT_SUBPROCESS_TIMEOUT,
+                           deadline=time.monotonic() + DEFAULT_ATTEMPT_TIMEOUT,
+                           home=home)
+        common_text = runner.run(source, "rev-parse", "--git-common-dir").stdout.strip()
+        worktree_text = runner.run(source, "rev-parse", "--git-dir").stdout.strip()
+    def git_path(value: str) -> Path:
+        path = Path(value)
+        return (source / path).resolve() if not path.is_absolute() else path.resolve()
+    protected = (source, git_path(common_text), git_path(worktree_text))
+    boundary_paths = {
+        "workflow config": config_path.resolve(),
+        "workflow index": index_path.resolve(),
+        "frozen plan": Path(apply["plan"]).resolve(),
+        "output worktree": Path(apply["output_worktree"]).resolve(),
+        "apply evidence": Path(apply["evidence_dir"]).resolve(),
+    }
+    for stage in ("preview", "apply", "replay-failure", f"currency-{currency_ordinal}",
+                  f"currency-{currency_ordinal}.json", f"currency-{currency_ordinal}-commands"):
+        boundary_paths[f"{stage} evidence"] = (index_path.parent / f"{run_id}-{stage}").resolve()
+    for label, path in boundary_paths.items():
+        if any(paths_overlap(path, item) for item in protected):
+            raise MaintenanceError(f"{label} overlaps source or Git metadata")
+    entries = list(boundary_paths.items())
+    for position, (left_label, left_path) in enumerate(entries):
+        for right_label, right_path in entries[position + 1:]:
+            if paths_overlap(left_path, right_path):
+                raise MaintenanceError(f"{left_label} overlaps {right_label}")
+
+
 def workflow_environment_identity() -> dict[str, Any]:
     """Bind the executable and policy inputs that can change deterministic replay."""
     root = Path(__file__).resolve().parent.parent
@@ -3612,6 +3651,103 @@ def workflow_save_index(path: Path, index: dict[str, Any], prior_sha: str) -> No
             os.unlink(temporary)
 
 
+def workflow_supervise(command: list[str], timeout: float = DEFAULT_ATTEMPT_TIMEOUT + 30) -> dict[str, Any]:
+    """Own the outer child group and boundedly retain its original pipe bytes."""
+    limit = MAX_HTTP_BYTES
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    streams = {"stdout": bytearray(), "stderr": bytearray()}
+    stream_eof = {"stdout": False, "stderr": False}
+    for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+        os.set_blocking(pipe.fileno(), False)
+        selector.register(pipe, selectors.EVENT_READ, name)
+    overflow = False
+    total = 0
+    timed_out = False
+    interrupted: str | None = None
+    primary_deadline = time.monotonic() + timeout
+    previous: dict[int, Any] = {}
+
+    def request_stop(signum: int, _frame: Any) -> None:
+        raise CaughtSignal(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        handler = signal.getsignal(signum)
+        if handler is not signal.SIG_IGN:
+            previous[signum] = handler
+            signal.signal(signum, request_stop)
+
+    def drain(until: float) -> None:
+        nonlocal total, overflow
+        while selector.get_map() and time.monotonic() < until:
+            events = selector.select(timeout=min(0.1, max(0.0, until - time.monotonic())))
+            for key, _ in events:
+                try:
+                    content = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not content:
+                    stream_eof[key.data] = True
+                    selector.unregister(key.fileobj)
+                    continue
+                available = max(0, limit - total)
+                streams[key.data].extend(content[:available])
+                total += min(len(content), available)
+                if len(content) > available:
+                    overflow = True
+            if overflow:
+                return
+
+    try:
+        try:
+            while True:
+                drain(min(primary_deadline, time.monotonic() + 0.1))
+                if overflow:
+                    break
+                if not selector.get_map() and process.poll() is not None:
+                    break
+                if time.monotonic() >= primary_deadline:
+                    timed_out = True
+                    break
+                if not selector.get_map():
+                    time.sleep(0.01)
+        except (CaughtSignal, KeyboardInterrupt) as exc:
+            interrupted = (signal.Signals(exc.signum).name if isinstance(exc, CaughtSignal)
+                           else "KeyboardInterrupt")
+        group_after_primary = process_group_absent(process.pid)
+        needs_settlement = timed_out or interrupted is not None or overflow or group_after_primary is not True
+        if needs_settlement:
+            for signum in previous:
+                signal.signal(signum, signal.SIG_IGN)
+            shutdown_deadline = time.monotonic() + SHUTDOWN_ALLOWANCE_SECONDS
+            group_settled = GitRunner._settle(process, shutdown_deadline)
+            drain(shutdown_deadline)
+        else:
+            group_settled = True
+        eof = stream_eof["stdout"] and stream_eof["stderr"]
+        absent_after_shutdown = process_group_absent(process.pid)
+        return {
+            "stdout": bytes(streams["stdout"]), "stderr": bytes(streams["stderr"]),
+            "direct_rc": process.poll(), "timed_out": timed_out,
+            "interrupted": interrupted, "capture_limit_exceeded": overflow,
+            "stdout_eof": stream_eof["stdout"], "stderr_eof": stream_eof["stderr"],
+            "group_absent_after_primary": group_after_primary,
+            "process_group_settled": group_settled,
+            "process_group_absent_after_shutdown": absent_after_shutdown,
+            "raw_complete": (eof and not overflow and group_settled and
+                             absent_after_shutdown is True and process.poll() is not None),
+            "shutdown_allowance_seconds": SHUTDOWN_ALLOWANCE_SECONDS if needs_settlement else 0,
+        }
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+
 def workflow_stage(operation: str, fields: dict[str, str], index: dict[str, Any],
                    index_path: Path, prior_sha: str) -> dict[str, Any]:
     command = [sys.executable, "-m", "tools.fork_maintenance", operation,
@@ -3621,29 +3757,30 @@ def workflow_stage(operation: str, fields: dict[str, str], index: dict[str, Any]
     index["stages"][operation] = {"status": "in_progress", "direct_rc": None,
                                   "evidence_dir": str(stage_dir)}
     workflow_save_index(index_path, index, prior_sha)
-    timed_out = False
-    try:
-        completed = subprocess.run(command, capture_output=True,
-                                   timeout=DEFAULT_ATTEMPT_TIMEOUT + 30)
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        completed = subprocess.CompletedProcess(command, None, exc.stdout or b"",
-                                                exc.stderr or b"")
+    supervised = workflow_supervise(command)
     stdout_path, stderr_path = stage_dir / "stdout.raw", stage_dir / "stderr.raw"
-    exclusive_write_bytes(stdout_path, completed.stdout)
-    exclusive_write_bytes(stderr_path, completed.stderr)
-    if timed_out:
+    exclusive_write_bytes(stdout_path, supervised["stdout"])
+    exclusive_write_bytes(stderr_path, supervised["stderr"])
+    if supervised["timed_out"] and not supervised["raw_complete"]:
+        outcome = {"status": "uncertain", "error": "outer stage timeout left incomplete evidence or owner"}
+    elif supervised["timed_out"]:
         outcome = {"status": "timeout", "error": "outer workflow stage deadline elapsed",
                    "stage_timeout_seconds": DEFAULT_ATTEMPT_TIMEOUT + 30}
+    elif supervised["interrupted"]:
+        outcome = {"status": "interrupted", "error": supervised["interrupted"]}
+    elif not supervised["raw_complete"] or supervised["group_absent_after_primary"] is not True:
+        outcome = {"status": "uncertain", "error": "outer stage group or pipe settlement is uncertain"}
     else:
         try:
-            outcome = json.loads((completed.stdout if completed.returncode == 0 else completed.stderr).decode())
+            outcome = json.loads((supervised["stdout"] if supervised["direct_rc"] == 0
+                                  else supervised["stderr"]).decode())
         except (UnicodeError, json.JSONDecodeError):
             outcome = {"status": "unparseable"}
-    return {"status": outcome.get("status"), "direct_rc": completed.returncode,
-            "stdout_path": str(stdout_path), "stdout_sha256": sha256_bytes(completed.stdout),
-            "stderr_path": str(stderr_path), "stderr_sha256": sha256_bytes(completed.stderr),
-            "outcome": outcome}
+    return {"status": outcome.get("status"), "direct_rc": supervised["direct_rc"],
+            "stdout_path": str(stdout_path), "stdout_sha256": sha256_bytes(supervised["stdout"]),
+            "stderr_path": str(stderr_path), "stderr_sha256": sha256_bytes(supervised["stderr"]),
+            "settlement": {key: value for key, value in supervised.items()
+                           if key not in {"stdout", "stderr"}}, "outcome": outcome}
 
 
 def workflow_replay_apply(index: dict[str, Any], index_path: Path,
@@ -3655,33 +3792,36 @@ def workflow_replay_apply(index: dict[str, Any], index_path: Path,
         raise MaintenanceError("apply ownership or result is uncertain; refusing composite replay")
     command = [sys.executable, "-m", "tools.fork_maintenance", "apply",
                *workflow_arguments("apply", {**config, "expected_plan_sha256": pin})]
-    timed_out = False
-    try:
-        completed = subprocess.run(command, capture_output=True,
-                                   timeout=DEFAULT_ATTEMPT_TIMEOUT + 30)
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        completed = subprocess.CompletedProcess(command, None, exc.stdout or b"",
-                                                exc.stderr or b"")
-    if timed_out:
+    supervised = workflow_supervise(command)
+    if supervised["timed_out"] and not supervised["raw_complete"]:
+        response = {"status": "uncertain", "error": "outer replay timeout left incomplete evidence or owner"}
+    elif supervised["timed_out"]:
         response = {"status": "timeout", "error": "outer workflow replay deadline elapsed",
                     "stage_timeout_seconds": DEFAULT_ATTEMPT_TIMEOUT + 30}
+    elif supervised["interrupted"]:
+        response = {"status": "interrupted", "error": supervised["interrupted"]}
+    elif not supervised["raw_complete"] or supervised["group_absent_after_primary"] is not True:
+        response = {"status": "uncertain", "error": "outer replay group or pipe settlement is uncertain"}
     else:
         try:
-            response = json.loads((completed.stdout if completed.returncode == 0 else completed.stderr).decode())
+            response = json.loads((supervised["stdout"] if supervised["direct_rc"] == 0
+                                   else supervised["stderr"]).decode())
         except (UnicodeError, json.JSONDecodeError):
             response = {"status": "unparseable"}
-    if completed.returncode == 0 and response.get("status") == "replayed":
+    if (supervised["direct_rc"] == 0 and response.get("status") == "replayed" and
+            supervised["raw_complete"] and supervised["group_absent_after_primary"] is True):
         return
     failure_dir = index_path.parent / f"{index['run_id']}-replay-failure"
     failure_dir.mkdir(mode=0o700, exist_ok=False)
     stdout_path, stderr_path = failure_dir / "stdout.raw", failure_dir / "stderr.raw"
-    exclusive_write_bytes(stdout_path, completed.stdout)
-    exclusive_write_bytes(stderr_path, completed.stderr)
+    exclusive_write_bytes(stdout_path, supervised["stdout"])
+    exclusive_write_bytes(stderr_path, supervised["stderr"])
     index["replay_failure"] = {
-        "direct_rc": completed.returncode, "outcome": response,
-        "stdout_path": str(stdout_path), "stdout_sha256": sha256_bytes(completed.stdout),
-        "stderr_path": str(stderr_path), "stderr_sha256": sha256_bytes(completed.stderr),
+        "direct_rc": supervised["direct_rc"], "outcome": response,
+        "stdout_path": str(stdout_path), "stdout_sha256": sha256_bytes(supervised["stdout"]),
+        "stderr_path": str(stderr_path), "stderr_sha256": sha256_bytes(supervised["stderr"]),
+        "settlement": {key: value for key, value in supervised.items()
+                       if key not in {"stdout", "stderr"}},
     }
     workflow_save_index(index_path, index, prior_sha)
     raise MaintenanceError("apply replay refused; retained raw evidence requires inspection")
@@ -3752,12 +3892,14 @@ def workflow_currency(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     """Record a diagnostic boundary observation; never promote or rewrite a plan."""
     index_path = Path(args.evidence_index).resolve()
     index = workflow_load_index(index_path, args.run_id, currency=True)
+    workflow_admit_paths(index["config"], index_path, Path(index["config_path"]),
+                         args.run_id, len(index.get("currency_observations", [])) + 1)
     workflow_observe_checkpoints(index)
     if any(index.get(name) for name in (
         "observed_config_drift", "observed_environment_drift", "observed_checkpoint_drift"
     )):
         return {"run_id": args.run_id, **workflow_project(index, True)}, EXIT_REFUSED
-    if index.get("terminal_stop") or index.get("currency_unknown"):
+    if index.get("terminal_stop") or index.get("currency_unknown") or index.get("replay_failure"):
         return {"run_id": args.run_id, **workflow_project(index, True)}, EXIT_REFUSED
     config = index["config"]
     preview_fields = config.get("preview")
@@ -3800,6 +3942,8 @@ def workflow_currency(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     os.close(fd)
     try:
         prior_sha = sha256_bytes(index_path.read_bytes())
+        # The saved result bytes alone cannot establish the current checkout.
+        workflow_replay_apply(index, index_path, index["plan_sha256"], prior_sha)
         ordinal = len(index.get("currency_observations", [])) + 1
         observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         observation: dict[str, Any] = {
@@ -3891,6 +4035,7 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         config_bytes = config_path.read_bytes()
         config = workflow_config(json.loads(config_bytes))
         run_id = sha256_bytes(canonical_json({"config": config, "path": str(config_path)}))
+        workflow_admit_paths(config, index_path, config_path, run_id)
         if os.path.lexists(index_path):
             raise MaintenanceError("workflow index already exists; use resume")
         plan_path = Path(config["apply"]["plan"])
@@ -3912,6 +4057,7 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         run_id = args.run_id
         index = workflow_load_index(index_path, run_id, currency=True, allow_config_drift=True)
         config = index["config"]
+        workflow_admit_paths(config, index_path, Path(index["config_path"]), run_id)
         workflow_observe_checkpoints(index)
         if any(index.get(name) for name in (
             "observed_config_drift", "observed_environment_drift", "observed_checkpoint_drift"
