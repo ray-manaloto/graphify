@@ -1454,6 +1454,12 @@ def test_graph_has_legacy_ids_checks_local_id_in_merged_graph():
     stale = {**node, "id": "firecrawl-cli::firecrawl_cli", "local_id": "firecrawl_cli"}
     assert graph_has_legacy_ids([stale], root=".") is True
 
+    nested = {**node, "id": f"outer::{node['id']}", "repo": "outer"}
+    assert graph_has_legacy_ids([nested], root=".") is False
+
+    nested_stale = {**stale, "id": f"outer::{stale['id']}", "repo": "outer"}
+    assert graph_has_legacy_ids([nested_stale], root=".") is True
+
 
 # ── #2408: globally-scoped MCP node ids are not file-stem derived ──────────────
 
