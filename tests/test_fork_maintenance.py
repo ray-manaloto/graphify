@@ -4819,11 +4819,13 @@ def test_public_preview_retains_nonempty_partial_worker_streams(
     repos = make_repositories(tmp_path)
     before = source_fingerprint(repos["source"])
     worker = tmp_path / "synthetic-http-worker"
+    ready = tmp_path / "worker-wrote-partial-streams"
     worker.write_text(
         f"#!{sys.executable}\n"
         "import os,time\n"
         "os.write(1,b'HTTP-PARTIAL\\x00\\xff\\r\\n')\n"
         "os.write(2,b'HTTP-DIAGNOSTIC\\x00\\xfe\\r\\n')\n"
+        f"open({str(ready)!r}, 'wb').close()\n"
         "time.sleep(20)\n",
         encoding="utf-8",
     )
@@ -4837,6 +4839,21 @@ def test_public_preview_retains_nonempty_partial_worker_streams(
             return getattr(sys, name)
 
     engine.sys = WorkerProxy()
+    launch_owned = engine.launch_owned
+
+    def launch_after_partial_streams(argv: list[str], **options: Any) -> subprocess.Popen[bytes]:
+        process = launch_owned(argv, **options)
+        if argv[0] == str(worker):
+            startup_deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < startup_deadline:
+                time.sleep(0.01)
+            if not ready.exists():
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=2)
+                pytest.fail("synthetic HTTP worker did not write partial streams")
+        return process
+
+    monkeypatch.setattr(engine, "launch_owned", launch_after_partial_streams)
     plan = tmp_path / "plan.json"
     direct_rc = engine.main([
         "preview", "--source-repo", str(repos["source"]),
@@ -4845,7 +4862,7 @@ def test_public_preview_retains_nonempty_partial_worker_streams(
         "--upstream-url", str(repos["upstream"]),
         "--github-releases-url", "http://127.0.0.1:9/stall",
         "--pypi-base-url", "http://127.0.0.1:9",
-        "--network-timeout", "0.4", "--attempt-timeout", "30",
+        "--network-timeout", "8", "--attempt-timeout", "30",
         "--output-plan", str(plan),
     ])
     captured = capsys.readouterr()
