@@ -355,7 +355,13 @@ def test_workflow_checkpoint_reuses_exact_inputs_and_reports_partial_progress(tm
     resumed = run_cli("resume", "--evidence-index", str(index), "--run-id", state["run_id"])
     assert resumed.returncode == 2
     assert json.loads(resumed.stderr)["next_action"] == "qualify_capabilities"
-    assert index.read_bytes() == before_index
+    after_resume = json.loads(index.read_text())
+    assert after_resume["replay_attempt"]["status"] == "replayed"
+    assert after_resume["replay_attempt"]["ordinal"] == 1
+    assert after_resume["replay_attempt"]["direct_rc"] == 0
+    assert after_resume["replay_attempt"]["owner_state"] == "observed_complete"
+    assert after_resume["stages"] == state["stages"]
+    assert index.read_bytes() != before_index
     assert plan.read_bytes() == before_plan
     assert (evidence / "result.json").read_bytes() == before_result
 
@@ -583,14 +589,20 @@ def test_workflow_requires_external_pin_before_any_apply_mutation(tmp_path: Path
                     "--expected-plan-sha256", pin)
     assert again.returncode != 0
     assert (evidence / "result.json").read_bytes() == result_before
-    assert index.read_bytes() == index_before
+    after_replay = json.loads(index.read_text())
+    assert after_replay["replay_attempt"]["status"] == "replayed"
+    assert after_replay["replay_attempt"]["ordinal"] == 1
+    assert after_replay["replay_attempt"]["direct_rc"] == 0
+    assert after_replay["replay_attempt"]["owner_state"] == "observed_complete"
+    assert index.read_bytes() != index_before
+    replayed_index = index.read_bytes()
     retained_lock = evidence / "attempt.lock"
     retained_lock.write_text("incomplete owner", encoding="utf-8")
     blocked = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id,
                       "--expected-plan-sha256", pin)
     assert blocked.returncode == 2
     assert "ownership or result is uncertain" in json.loads(blocked.stderr)["error"]
-    assert index.read_bytes() == index_before
+    assert index.read_bytes() == replayed_index
 
 
 def test_workflow_prewrite_admission_refuses_source_and_plan_aliases(tmp_path: Path) -> None:
