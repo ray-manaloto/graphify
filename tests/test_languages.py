@@ -3372,6 +3372,45 @@ def test_markdown_wikilink_excludes_follow_scan_options_without_stale_cache(tmp_
     assert len(references(None)) == 1
 
 
+def test_markdown_missing_target_then_ignored_file_does_not_replay_cache(tmp_path):
+    """A dangling inline link must disappear when its target becomes ignored."""
+    from graphify.extract import extract
+
+    source = tmp_path / "entry.md"
+    source.write_text("See [secret](secret.md).\n", encoding="utf-8")
+
+    def references():
+        graph = extract([source], root=tmp_path, cache_root=tmp_path, parallel=False)
+        return [edge for edge in graph["edges"] if edge["relation"] == "references"]
+
+    assert len(references()) == 1
+    (tmp_path / "secret.md").write_text("# Secret\n", encoding="utf-8")
+    (tmp_path / ".graphifyignore").write_text("secret.md\n", encoding="utf-8")
+    assert references() == []
+
+
+def test_markdown_dot_directory_policy_change_invalidates_cache(tmp_path):
+    """Direct links into scanner-visible dot dirs must follow current exclusions."""
+    from graphify.extract import extract
+
+    agents = tmp_path / ".agents"
+    agents.mkdir()
+    source = agents / "entry.md"
+    source.write_text("See [[secret]].\n", encoding="utf-8")
+    (agents / "secret.md").write_text("# Secret\n", encoding="utf-8")
+
+    def references(excludes):
+        graph = extract(
+            [source], root=tmp_path, cache_root=tmp_path,
+            parallel=False, extra_excludes=excludes,
+        )
+        return [edge for edge in graph["edges"] if edge["relation"] == "references"]
+
+    assert len(references(None)) == 1
+    assert references([".agents/secret.md"]) == []
+    assert len(references(None)) == 1
+
+
 # ── Groovy ───────────────────────────────────────────────────────────────────
 
 

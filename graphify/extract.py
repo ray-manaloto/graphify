@@ -51,7 +51,7 @@ from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
-from graphify.extractors.markdown import extract_markdown, _MD_LINK_INDEX_CACHE, _MD_LINKABLE_EXTS, _build_link_index  # noqa: F401
+from graphify.extractors.markdown import extract_markdown, _MD_LINK_INDEX_CACHE, _MD_IGNORED_PREDICATES, _MD_LINKABLE_EXTS, _build_link_index, _cached_ignored_predicate  # noqa: F401
 from graphify.extractors.ocaml import extract_ocaml  # noqa: F401
 from graphify.extractors.pascal_forms import extract_delphi_form, extract_lazarus_form  # noqa: F401
 from graphify.extractors.powershell import extract_powershell, extract_powershell_manifest  # noqa: F401
@@ -6282,7 +6282,9 @@ _XAML_CSHARP_CLASS_CACHE: dict[str, dict[str, list[dict]]] = {}
 def _markdown_cache_fingerprint(
     root: Path, extra_excludes: list[str] | None, gitignore: bool,
 ) -> str | None:
-    """Key Markdown AST cache entries to the current linkable corpus."""
+    """Key Markdown AST entries to linkable paths and effective ignore policy."""
+    from graphify.detect import _is_noise_dir, _load_graphifyignore
+
     try:
         index = _build_link_index(
             root, extra_excludes=extra_excludes, gitignore=gitignore,
@@ -6290,11 +6292,49 @@ def _markdown_cache_fingerprint(
     except OSError:
         return None
     _MD_LINK_INDEX_CACHE[str(root)] = index
+    ignored = _cached_ignored_predicate(root, extra_excludes, gitignore)
     digest = hashlib.sha256()
-    for basename in sorted(index):
-        for _, relative, _ in sorted(index[basename]):
-            digest.update(relative.encode("utf-8", errors="surrogateescape"))
-            digest.update(b"\0")
+    digest.update(json.dumps(
+        {"excludes": extra_excludes or [], "gitignore": gitignore},
+        sort_keys=True,
+    ).encode())
+    for anchor, pattern in _load_graphifyignore(root, gitignore=gitignore):
+        digest.update(str(anchor).encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(pattern.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+    # cache_root can double as the inferred scan root before its output
+    # directory has been created. Its empty inventory must have the same key
+    # after only graphify-out/ is written beneath it.
+    if not root.exists():
+        return digest.hexdigest()[:20]
+
+    def on_walk_error(error: OSError) -> None:
+        raise error
+
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, onerror=on_walk_error):
+            directory = Path(dirpath)
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if not _is_noise_dir(name, directory)
+                and not ignored(directory / name)
+            )
+            for name in sorted(filenames):
+                path = directory / name
+                relative = path.relative_to(root).as_posix()
+                if path.suffix.lower() in _MD_LINKABLE_EXTS:
+                    digest.update(b"path\0")
+                    digest.update(relative.encode("utf-8", errors="surrogateescape"))
+                    digest.update(b"\0")
+                if name in (".graphifyignore", ".gitignore"):
+                    digest.update(b"policy\0")
+                    digest.update(relative.encode("utf-8", errors="surrogateescape"))
+                    digest.update(b"\0")
+                    digest.update(path.read_bytes())
+                    digest.update(b"\0")
+    except OSError:
+        return None
     return digest.hexdigest()[:20]
 
 
@@ -7300,6 +7340,7 @@ def extract(
     _PACKAGE_IMPORTS_CACHE.clear()
     _XAML_CSHARP_CLASS_CACHE.clear()
     _MD_LINK_INDEX_CACHE.clear()
+    _MD_IGNORED_PREDICATES.clear()
     _SCAN_ROOT_NAMESPACE_CACHE.clear()
     # Path-resolution memoization (#3500) is keyed by (path, cwd) with no mtime
     # component, so — like the alias caches above — a symlink repoint or a path

@@ -125,6 +125,9 @@ def _parse_frontmatter_fallback(fm_lines: list[str]) -> dict:
 # (beside _WORKSPACE_PACKAGE_CACHE) so a serial rerun in one process sees
 # files created since the last run; parallel workers are fresh processes.
 _MD_LINK_INDEX_CACHE: "dict[str, dict[str, list[tuple[int, str, Path]]]]" = {}
+_MD_IGNORED_PREDICATES: dict[
+    tuple[str, tuple[str, ...], bool], Callable[[Path], bool]
+] = {}
 
 
 def _active_scan_root() -> "Path | None":
@@ -146,6 +149,21 @@ def _active_ignore_options() -> "tuple[list[str] | None, bool]":
     )
 
 
+def _cached_ignored_predicate(
+    root: Path, extra_excludes: list[str] | None, gitignore: bool,
+) -> Callable[[Path], bool]:
+    from graphify.detect import ignored_predicate
+
+    key = (str(root.resolve()), tuple(extra_excludes or ()), gitignore)
+    ignored = _MD_IGNORED_PREDICATES.get(key)
+    if ignored is None:
+        ignored = ignored_predicate(
+            root, extra_excludes=extra_excludes, gitignore=gitignore,
+        )
+        _MD_IGNORED_PREDICATES[key] = ignored
+    return ignored
+
+
 def _nfc(s: str) -> str:
     # Filesystems disagree on Unicode normalization (macOS decomposes, others
     # do not); a link typed in NFC must still find a file listed in NFD.
@@ -163,9 +181,9 @@ def _build_link_index(
     boundary the scanner draws, and Obsidian itself does not index dot-folders
     or ignored paths (#3822).
     """
-    from graphify.detect import _SKIP_DIRS, ignored_predicate
+    from graphify.detect import _SKIP_DIRS
     root = Path(root)
-    ignored = ignored_predicate(root, extra_excludes=extra_excludes, gitignore=gitignore)
+    ignored = _cached_ignored_predicate(root, extra_excludes, gitignore)
     index: dict[str, list[tuple[int, str, Path]]] = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dp = Path(dirpath)
@@ -274,7 +292,7 @@ def _resolve_markdown_link(
                     return Path(os.path.normpath(str(hit)))
             if ignored is not None and ignored(resolved):
                 return None
-    if ignored is not None and resolved.is_file() and ignored(resolved):
+    if ignored is not None and ignored(resolved):
         return None
     return resolved
 
@@ -434,11 +452,8 @@ def extract_markdown(path: Path) -> dict:
     scan_root = _active_scan_root()
     ignored = None
     if scan_root is not None:
-        from graphify.detect import ignored_predicate
         excludes, gitignore = _active_ignore_options()
-        ignored = ignored_predicate(
-            scan_root, extra_excludes=excludes, gitignore=gitignore,
-        )
+        ignored = _cached_ignored_predicate(scan_root, excludes, gitignore)
     # Dedup link edges by resolved target node so a hub doc that links to the
     # same sibling many times yields one edge, not N (keeps weights meaningful).
     linked_targets: set[str] = set()
