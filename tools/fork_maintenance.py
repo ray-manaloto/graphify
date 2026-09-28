@@ -3718,6 +3718,7 @@ def workflow_supervise(command: list[str], timeout: float = DEFAULT_ATTEMPT_TIME
     pending_signal: int | None = None
     process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
+    shutdown_deadline: float | None = None
 
     def request_stop(signum: int, _frame: Any) -> None:
         nonlocal pending_signal
@@ -3815,7 +3816,9 @@ def workflow_supervise(command: list[str], timeout: float = DEFAULT_ATTEMPT_TIME
         # Signals during launch only set pending_signal, so the handle is assigned
         # before any interruption path can unwind this scope.
         if process is not None:
-            GitRunner._settle(process, time.monotonic() + SHUTDOWN_ALLOWANCE_SECONDS)
+            shutdown_deadline = shutdown_deadline or (
+                time.monotonic() + SHUTDOWN_ALLOWANCE_SECONDS)
+            GitRunner._settle(process, shutdown_deadline)
         raise
     finally:
         for signum, handler in previous.items():

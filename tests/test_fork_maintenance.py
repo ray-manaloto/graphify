@@ -1083,6 +1083,28 @@ def test_workflow_signal_during_launch_settles_owned_group(tmp_path: Path) -> No
     assert not sentinel.exists()
 
 
+def test_workflow_exception_reuses_first_shutdown_deadline(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = load_engine()
+    original = engine.GitRunner._settle
+    deadlines: list[float] = []
+
+    def settle_then_fail(process: subprocess.Popen[Any], deadline: float) -> bool:
+        deadlines.append(deadline)
+        settled = original(process, deadline)
+        if len(deadlines) == 1:
+            raise RuntimeError("fixture failure after settlement")
+        return settled
+
+    monkeypatch.setattr(engine.GitRunner, "_settle", staticmethod(settle_then_fail))
+    with pytest.raises(RuntimeError, match="fixture failure after settlement"):
+        engine.workflow_supervise(
+            [sys.executable, "-c", "import time; time.sleep(20)"], timeout=0.2)
+    assert len(deadlines) == 2
+    assert deadlines[0] == deadlines[1]
+
+
 def test_workflow_outer_escaped_pipe_holder_is_bounded_unknown(tmp_path: Path) -> None:
     engine = load_engine()
     sentinel = tmp_path / "escaped-sentinel"
