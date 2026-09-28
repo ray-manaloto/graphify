@@ -38,6 +38,7 @@ MAX_STREAM_CHARS = 128 * 1024
 DEFAULT_SUBPROCESS_TIMEOUT = 30.0
 DEFAULT_ATTEMPT_TIMEOUT = 300.0
 SHUTDOWN_ALLOWANCE_SECONDS = 10.0
+COMPOSITE_GROUP_ENV = "GRAPHIFY_FORK_COMPOSITE_GROUP"
 
 
 SETTLE_GRACE_SECONDS = 2.0
@@ -197,6 +198,15 @@ def acquire_owned(create: Callable[[], OwnedT]) -> OwnedT:
 
 def launch_owned(argv: list[str], **options: Any) -> subprocess.Popen[bytes]:
     return acquire_owned(lambda: subprocess.Popen[bytes](argv, **options))
+
+
+def composite_worker_group() -> bool:
+    """The supervised engine is the leader of its private composite group."""
+
+    # The marker names this engine's direct parent, not an ambient boolean that
+    # a standalone preview/apply could accidentally inherit from a shell.
+    return (os.environ.get(COMPOSITE_GROUP_ENV) == str(os.getppid()) and
+            os.getpid() == os.getpgrp())
 
 
 def launch_owned_lock(lock: Path) -> int:
@@ -371,6 +381,7 @@ class GitRunner:
             argv.extend(("-C", str(repo)))
         argv.extend(arguments)
         started = time.monotonic()
+        shared_group = composite_worker_group()
         try:
             process = launch_owned(
                 argv,
@@ -379,7 +390,7 @@ class GitRunner:
                 stderr=subprocess.PIPE,
                 env=self.environment,
                 cwd=self.home,
-                start_new_session=True,
+                start_new_session=not shared_group,
             )
         except OSError as exc:
             raise MaintenanceError(f"could not launch Git: {exc}") from exc
@@ -420,7 +431,8 @@ class GitRunner:
                                     drained = True
                                     primary_captured = True
                                     group_observation, group_observation_performed = (
-                                        process_group_absent(process.pid), True
+                                        (process.poll() is not None if shared_group else
+                                         process_group_absent(process.pid)), True
                                     )
                                     settled = group_observation is True
                                     group_survived_primary = not settled
@@ -449,10 +461,12 @@ class GitRunner:
                                 # First terminal transition: the one shared shutdown allowance starts here.
                                 deadline = self.begin_shutdown()
                                 if drained:
-                                    settled = self._settle(process, deadline)
+                                    settled = (settle_direct_worker(process, deadline) if shared_group
+                                               else self._settle(process, deadline))
                                 else:
                                     stdout, stderr, drained, settled = terminate_and_drain(
-                                        process, deadline, stdout, stderr
+                                        process, deadline, stdout, stderr,
+                                        shared_group=shared_group,
                                     )
                                 break
                             except CaughtSignal as exc:
@@ -467,14 +481,20 @@ class GitRunner:
                             record = {
                                 "argv": argv,
                                 "pid": process.pid,
-                                "process_group": process.pid,
+                                "process_group": os.getpgrp() if shared_group else process.pid,
+                                "group_ownership": "outer_composite" if shared_group else "worker",
                                 "cwd": str(self.home),
                                 "direct_rc": process.returncode,
                                 "duration_ms": round((time.monotonic() - started) * 1000),
                                 "mutating": mutating,
-                                "process_group_settled": settled,
-                                "process_group_absent_after_primary": group_observation,
-                                "process_group_observed": group_observation_performed,
+                                "process_group_settled": None if shared_group else settled,
+                                "worker_settled": settled,
+                                "process_group_absent_after_primary": (
+                                    None if shared_group else group_observation),
+                                "process_group_observed": (
+                                    False if shared_group else group_observation_performed),
+                                "worker_exited_after_primary": (
+                                    group_observation if shared_group else None),
                                 "stderr": bounded_stream(stderr),
                                 "stdout": bounded_stream(stdout),
                                 "timed_out": timed_out,
@@ -482,6 +502,7 @@ class GitRunner:
                                 "stdout_eof": drained,
                                 "stderr_eof": drained,
                                 "raw_complete": drained and settled and process.returncode is not None,
+                                "raw_complete_scope": "worker" if shared_group else "group",
                                 "_stdout_raw": stdout,
                                 "_stderr_raw": stderr,
                             }
@@ -640,8 +661,28 @@ class GitRunner:
         return False
 
 
+def settle_direct_worker(process: subprocess.Popen[Any], deadline: float) -> bool:
+    """Settle one composite worker; the outer supervisor owns its shared group."""
+
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        if process.poll() is not None:
+            return True
+        try:
+            process.send_signal(signum)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=max(0.0, min(SETTLE_GRACE_SECONDS / 2,
+                                               deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            continue
+        return True
+    return process.poll() is not None
+
+
 def terminate_and_drain(
-    process: subprocess.Popen[bytes], deadline: float, stdout: bytes, stderr: bytes
+    process: subprocess.Popen[bytes], deadline: float, stdout: bytes, stderr: bytes,
+    *, shared_group: bool = False,
 ) -> tuple[bytes, bytes, bool, bool]:
     """Settle an owned group and drain its pipes within the shared shutdown deadline.
 
@@ -650,7 +691,8 @@ def terminate_and_drain(
     """
 
     with signal_protection():
-        settled = GitRunner._settle(process, deadline)
+        settled = (settle_direct_worker(process, deadline) if shared_group
+                   else GitRunner._settle(process, deadline))
         drain = max(0.0, min(SETTLE_GRACE_SECONDS, deadline - time.monotonic()))
         try:
             stdout, stderr = process.communicate(timeout=drain)
@@ -1094,13 +1136,14 @@ def http_json(
         url,
         str(request_deadline - started),
     ]
+    shared_group = composite_worker_group()
     try:
         process = launch_owned(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True,
+            start_new_session=not shared_group,
         )
     except OSError as exc:
         raise MaintenanceError(f"could not launch HTTP worker: {exc}") from exc
@@ -1143,7 +1186,8 @@ def http_json(
                                     drained = True  # a returned communicate() observed EOF on both pipes
                                     primary_captured = True
                                     group_observation, group_observation_performed = (
-                                        process_group_absent(process.pid), True
+                                        (process.poll() is not None if shared_group else
+                                         process_group_absent(process.pid)), True
                                     )
                                     settled = group_observation is True
                                     group_survived_primary = not settled
@@ -1175,10 +1219,13 @@ def http_json(
                                     else time.monotonic() + SHUTDOWN_ALLOWANCE_SECONDS
                                 )
                                 if drained:
-                                    settled = GitRunner._settle(process, shutdown_deadline)
+                                    settled = (settle_direct_worker(process, shutdown_deadline)
+                                               if shared_group else
+                                               GitRunner._settle(process, shutdown_deadline))
                                 else:
                                     stdout, stderr, drained, settled = terminate_and_drain(
-                                        process, shutdown_deadline, stdout, stderr
+                                        process, shutdown_deadline, stdout, stderr,
+                                        shared_group=shared_group,
                                     )
                                 break
                             except CaughtSignal as exc:
@@ -1194,19 +1241,26 @@ def http_json(
                             record = {
                                 "argv": argv,
                                 "pid": process.pid,
-                                "process_group": process.pid,
+                                "process_group": os.getpgrp() if shared_group else process.pid,
+                                "group_ownership": "outer_composite" if shared_group else "worker",
                                 "direct_rc": process.returncode,
                                 "duration_ms": round((finished - started) * 1000),
                                 "mutating": False,
                                 "origin": "http_worker_envelope",
-                                "process_group_settled": settled,
-                                "process_group_absent_after_primary": group_observation,
-                                "process_group_observed": group_observation_performed,
+                                "process_group_settled": None if shared_group else settled,
+                                "worker_settled": settled,
+                                "process_group_absent_after_primary": (
+                                    None if shared_group else group_observation),
+                                "process_group_observed": (
+                                    False if shared_group else group_observation_performed),
+                                "worker_exited_after_primary": (
+                                    group_observation if shared_group else None),
                                 "timed_out": timed_out,
                                 "interrupted": interrupted is not None,
                                 "stdout_eof": drained,
                                 "stderr_eof": drained,
                                 "raw_complete": drained and settled and process.returncode is not None,
+                                "raw_complete_scope": "worker" if shared_group else "group",
                                 "stdout": bounded_stream(stdout),
                                 "stderr": bounded_stream(stderr),
                                 "_stdout_raw": stdout,
@@ -3654,24 +3708,22 @@ def workflow_save_index(path: Path, index: dict[str, Any], prior_sha: str) -> No
 def workflow_supervise(command: list[str], timeout: float = DEFAULT_ATTEMPT_TIMEOUT + 30) -> dict[str, Any]:
     """Own the outer child group and boundedly retain its original pipe bytes."""
     limit = MAX_HTTP_BYTES
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               start_new_session=True)
-    assert process.stdout is not None and process.stderr is not None
-    selector = selectors.DefaultSelector()
     streams = {"stdout": bytearray(), "stderr": bytearray()}
     stream_eof = {"stdout": False, "stderr": False}
-    for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
-        os.set_blocking(pipe.fileno(), False)
-        selector.register(pipe, selectors.EVENT_READ, name)
     overflow = False
     total = 0
     timed_out = False
     interrupted: str | None = None
-    primary_deadline = time.monotonic() + timeout
     previous: dict[int, Any] = {}
+    pending_signal: int | None = None
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
 
     def request_stop(signum: int, _frame: Any) -> None:
-        raise CaughtSignal(signum)
+        nonlocal pending_signal
+        # Do not unwind Popen before its owned handle can be assigned. The first
+        # loop observation settles it under the same shutdown allowance.
+        pending_signal = pending_signal or signum
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         handler = signal.getsignal(signum)
@@ -3681,6 +3733,7 @@ def workflow_supervise(command: list[str], timeout: float = DEFAULT_ATTEMPT_TIME
 
     def drain(until: float) -> None:
         nonlocal total, overflow
+        assert selector is not None
         while selector.get_map() and time.monotonic() < until:
             events = selector.select(timeout=min(0.1, max(0.0, until - time.monotonic())))
             for key, _ in events:
@@ -3701,8 +3754,21 @@ def workflow_supervise(command: list[str], timeout: float = DEFAULT_ATTEMPT_TIME
                 return
 
     try:
+        child_env = os.environ.copy()
+        child_env[COMPOSITE_GROUP_ENV] = str(os.getpid())
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True, env=child_env)
+        assert process.stdout is not None and process.stderr is not None
+        selector = selectors.DefaultSelector()
+        for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, name)
+        primary_deadline = time.monotonic() + timeout
         try:
             while True:
+                if pending_signal is not None:
+                    interrupted = signal.Signals(pending_signal).name
+                    break
                 drain(min(primary_deadline, time.monotonic() + 0.1))
                 if overflow:
                     break
@@ -3716,6 +3782,8 @@ def workflow_supervise(command: list[str], timeout: float = DEFAULT_ATTEMPT_TIME
         except (CaughtSignal, KeyboardInterrupt) as exc:
             interrupted = (signal.Signals(exc.signum).name if isinstance(exc, CaughtSignal)
                            else "KeyboardInterrupt")
+        if pending_signal is not None:
+            interrupted = signal.Signals(pending_signal).name
         group_after_primary = process_group_absent(process.pid)
         needs_settlement = timed_out or interrupted is not None or overflow or group_after_primary is not True
         if needs_settlement:
@@ -3736,16 +3804,29 @@ def workflow_supervise(command: list[str], timeout: float = DEFAULT_ATTEMPT_TIME
             "group_absent_after_primary": group_after_primary,
             "process_group_settled": group_settled,
             "process_group_absent_after_shutdown": absent_after_shutdown,
-            "raw_complete": (eof and not overflow and group_settled and
+            "descendant_ownership": ("outer_group_only" if needs_settlement else
+                                     "cooperative_engine_exit"),
+            "raw_complete": (not needs_settlement and eof and not overflow and group_settled and
                              absent_after_shutdown is True and process.poll() is not None),
             "shutdown_allowance_seconds": SHUTDOWN_ALLOWANCE_SECONDS if needs_settlement else 0,
         }
+    except BaseException:
+        # This also covers a failure while registering pipes after Popen returned.
+        # Signals during launch only set pending_signal, so the handle is assigned
+        # before any interruption path can unwind this scope.
+        if process is not None:
+            GitRunner._settle(process, time.monotonic() + SHUTDOWN_ALLOWANCE_SECONDS)
+        raise
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
+        if selector is not None:
+            selector.close()
+        if process is not None:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
 
 
 def workflow_stage(operation: str, fields: dict[str, str], index: dict[str, Any],

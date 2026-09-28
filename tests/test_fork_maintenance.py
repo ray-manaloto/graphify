@@ -886,7 +886,7 @@ def test_workflow_outer_stage_and_replay_settle_real_descendant(
         [sys.executable, "-c", parent, str(sentinel)], timeout=0.3))
     prior = hashlib.sha256(index_path.read_bytes()).hexdigest()
     receipt = engine.workflow_stage("preview", {}, index, index_path, prior)
-    assert receipt["status"] == "timeout"
+    assert receipt["status"] == "uncertain"
     assert receipt["direct_rc"] is not None
     assert Path(receipt["stdout_path"]).read_bytes() == b"partial out\n"
     assert Path(receipt["stderr_path"]).read_bytes() == b"partial err\n"
@@ -906,10 +906,179 @@ def test_workflow_outer_stage_and_replay_settle_real_descendant(
         engine.workflow_replay_apply(replay_index, replay_index_path, "0" * 64,
                                      hashlib.sha256(replay_index_path.read_bytes()).hexdigest())
     replay_receipt = json.loads(replay_index_path.read_text())["replay_failure"]
-    assert replay_receipt["outcome"]["status"] == "timeout"
+    assert replay_receipt["outcome"]["status"] == "uncertain"
     assert Path(replay_receipt["stdout_path"]).read_bytes() == b"partial out\n"
     assert Path(replay_receipt["stderr_path"]).read_bytes() == b"partial err\n"
     assert replay_receipt["settlement"]["process_group_absent_after_shutdown"] is True
+    time.sleep(1.6)
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("worker_kind", ["git", "http"])
+def test_workflow_controlled_private_pipe_worker_settles_with_outer_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_kind: str
+) -> None:
+    """A resistant worker with private pipes cannot write after stage or replay STOP."""
+
+    engine = load_engine()
+    sentinel = tmp_path / f"{worker_kind}-late"
+    identity = tmp_path / f"{worker_kind}-identity"
+    worker = tmp_path / f"{worker_kind}-worker"
+    worker.write_text(
+        f"#!{sys.executable}\n"
+        "import os,pathlib,signal,time\n"
+        f"pathlib.Path({str(identity)!r}).write_text(f'{{os.getpid()}} {{os.getpgrp()}}')\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(3.0)\n"
+        f"pathlib.Path({str(sentinel)!r}).write_text('late')\n",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    if worker_kind == "git":
+        invocation = (
+            "r=m.GitRunner(subprocess_timeout=20,deadline=time.monotonic()+20,"
+            "home=pathlib.Path(sys.argv[1])); "
+            "r.git_executable=sys.argv[2]; r.run(None,'status',mutating=True)"
+        )
+    else:
+        invocation = (
+            "original=m.launch_owned; "
+            "m.launch_owned=lambda argv,**options: original([sys.argv[2]],**options); "
+            "m.http_json('https://example.invalid/metadata',20,time.monotonic()+20,[])"
+        )
+    stage = (
+        "import pathlib,sys,time; from tools import fork_maintenance as m; "
+        "print('partial out',flush=True); print('partial err',file=sys.stderr,flush=True); "
+        + invocation
+    )
+    real_supervise = engine.workflow_supervise
+    monkeypatch.setattr(engine, "workflow_supervise", lambda _command: real_supervise(
+        [sys.executable, "-c", stage, str(tmp_path), str(worker)], timeout=1.2))
+    try:
+        for operation in ("stage", "replay"):
+            if operation == "stage":
+                index_path = tmp_path / "stage-index.json"
+                index: dict[str, Any] = {"run_id": "private-stage", "stages": {}}
+                index_path.write_bytes(engine.workflow_index_bytes(index))
+                receipt = engine.workflow_stage(
+                    "preview", {}, index, index_path,
+                    hashlib.sha256(index_path.read_bytes()).hexdigest())
+                assert receipt["status"] == "uncertain"
+            else:
+                index_path = tmp_path / "replay-index.json"
+                evidence = tmp_path / "replay-evidence"
+                evidence.mkdir()
+                (evidence / "result.json").write_text("{}", encoding="utf-8")
+                index = {"run_id": "private-replay", "stages": {},
+                         "config": {"apply": {"evidence_dir": str(evidence)}}}
+                index_path.write_bytes(engine.workflow_index_bytes(index))
+                with pytest.raises(engine.MaintenanceError, match="replay refused"):
+                    engine.workflow_replay_apply(
+                        index, index_path, "0" * 64,
+                        hashlib.sha256(index_path.read_bytes()).hexdigest())
+                receipt = json.loads(index_path.read_text())["replay_failure"]
+                assert receipt["outcome"]["status"] == "uncertain"
+            assert receipt["direct_rc"] is not None
+            assert Path(receipt["stdout_path"]).read_bytes() == b"partial out\n"
+            assert Path(receipt["stderr_path"]).read_bytes() == b"partial err\n"
+            assert receipt["settlement"]["process_group_settled"] is True
+            assert receipt["settlement"]["process_group_absent_after_shutdown"] is True
+            assert receipt["settlement"]["raw_complete"] is False
+            worker_pid, worker_group = map(int, identity.read_text().split())
+            assert worker_pid != worker_group  # The worker joined the engine group.
+            time.sleep(3.1)
+            assert not sentinel.exists()
+            identity.unlink()
+    finally:
+        if identity.exists():
+            worker_pid, worker_group = map(int, identity.read_text().split())
+            if worker_pid == worker_group:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(worker_group, signal.SIGKILL)
+            else:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(worker_pid, signal.SIGKILL)
+
+
+def test_standalone_git_worker_keeps_own_group_with_ambient_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = load_engine()
+    monkeypatch.setenv(engine.COMPOSITE_GROUP_ENV, "1")
+    runner = engine.GitRunner(subprocess_timeout=5, deadline=time.monotonic() + 10,
+                              home=tmp_path)
+    assert runner.run(None, "--version").returncode == 0
+    record = runner.records[0]
+    assert record["group_ownership"] == "worker"
+    assert record["process_group"] == record["pid"]
+    assert record["process_group_settled"] is True
+    assert record["raw_complete_scope"] == "group"
+
+
+def test_workflow_private_pipe_escaped_group_stops_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = load_engine()
+    sentinel = tmp_path / "escaped-private-sentinel"
+    child = (
+        "import pathlib,sys,time; time.sleep(2.0); "
+        "pathlib.Path(sys.argv[1]).write_text('late')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"p=subprocess.Popen([sys.executable,'-c',{child!r},sys.argv[1]],"
+        "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
+        "print(p.pid,flush=True); time.sleep(20)"
+    )
+    real_supervise = engine.workflow_supervise
+    monkeypatch.setattr(engine, "workflow_supervise", lambda _command: real_supervise(
+        [sys.executable, "-c", parent, str(sentinel)], timeout=0.4))
+    index_path = tmp_path / "escaped-index.json"
+    index: dict[str, Any] = {"run_id": "escaped-private", "stages": {}}
+    index_path.write_bytes(engine.workflow_index_bytes(index))
+    receipt = engine.workflow_stage(
+        "preview", {}, index, index_path, hashlib.sha256(index_path.read_bytes()).hexdigest())
+    child_pid = int(Path(receipt["stdout_path"]).read_text().splitlines()[0])
+    try:
+        assert receipt["status"] == "uncertain"
+        assert receipt["settlement"]["stdout_eof"] is True
+        assert receipt["settlement"]["stderr_eof"] is True
+        assert receipt["settlement"]["process_group_absent_after_shutdown"] is True
+        assert receipt["settlement"]["raw_complete"] is False
+        assert receipt["settlement"]["descendant_ownership"] == "outer_group_only"
+        os.kill(child_pid, 0)  # An escaped private-pipe worker is never called settled.
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child_pid, signal.SIGKILL)
+    time.sleep(2.1)
+    assert not sentinel.exists()
+
+
+def test_workflow_signal_during_launch_settles_owned_group(tmp_path: Path) -> None:
+    sentinel = tmp_path / "launch-sentinel"
+    stage = (
+        "import pathlib,sys,time; print('started',flush=True); "
+        "time.sleep(1.5); pathlib.Path(sys.argv[1]).write_text('late')"
+    )
+    probe = (
+        "import json,os,signal,subprocess,sys; "
+        "from tools import fork_maintenance as m; "
+        "real=subprocess.Popen; "
+        "def_launch=''; "
+        "exec('def launch(*args,**kwargs):\\n p=real(*args,**kwargs)\\n os.kill(os.getpid(),signal.SIGTERM)\\n return p'); "
+        "subprocess.Popen=launch; "
+        f"r=m.workflow_supervise([sys.executable,'-c',{stage!r},sys.argv[1]],timeout=10); "
+        "r.pop('stdout'); r.pop('stderr'); print(json.dumps(r),flush=True)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, str(sentinel)], cwd=ROOT,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15,
+    )
+    assert completed.returncode == 0, completed.stderr
+    receipt = json.loads(completed.stdout)
+    assert receipt["interrupted"] == "SIGTERM"
+    assert receipt["process_group_absent_after_shutdown"] is True
+    assert receipt["raw_complete"] is False
     time.sleep(1.6)
     assert not sentinel.exists()
 
