@@ -827,6 +827,19 @@ def graph_has_legacy_ids(nodes: list, root: str | Path | None = None, sample: in
         new_stem = make_id(_file_stem(rel))
         if not new_stem:
             continue
+        # Aggregated graphs namespace IDs as ``repo::local_id`` while keeping
+        # source_file relative to that repo. Compare the verified local ID to
+        # its file stem; normalizing the namespace can resemble an old stem.
+        repo = node.get("repo")
+        local_id = node.get("local_id")
+        if (
+            isinstance(repo, str)
+            and repo
+            and isinstance(local_id, str)
+            and local_id
+            and nid == f"{repo}::{local_id}"
+        ):
+            nid = local_id
         norm = _normalize_id(nid)
         if norm == new_stem or norm.startswith(new_stem + "_"):
             checked += 1
