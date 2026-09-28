@@ -3494,6 +3494,10 @@ def workflow_arguments(operation: str, fields: dict[str, str]) -> list[str]:
 
 def workflow_project(index: dict[str, Any], observed_plan_exists: bool | None) -> dict[str, Any]:
     progress = workflow_progress(index)
+    replay = index.get("replay_attempt")
+    if replay and replay.get("status") != "replayed":
+        return {"status": "stopped", "next_action": "inspect_replay_attempt",
+                "stopped_reason": "replay_uncertain", "progress": progress}
     if index.get("observed_config_drift"):
         return {"status": "stopped", "next_action": "inspect_config_drift",
                 "stopped_reason": "workflow_config_drift", "progress": progress}
@@ -3558,6 +3562,13 @@ def workflow_load_index(path: Path, run_id: str, *, currency: bool = False,
         raise MaintenanceError("workflow index integrity check failed")
     if index.get("run_id") != run_id:
         raise MaintenanceError("workflow run identity mismatch")
+    replay = index.get("replay_attempt")
+    if replay is not None and (not isinstance(replay, dict) or
+            replay.get("status") not in {"in_progress", "uncertain", "replayed"} or
+            replay.get("run_id") != run_id or
+            replay.get("plan_sha256") != index.get("plan_sha256") or
+            not isinstance(replay.get("ordinal"), int) or replay["ordinal"] < 1):
+        raise MaintenanceError("workflow replay attempt is malformed or drifted")
     if (not isinstance(index.get("config_path"), str) or
             not Path(index["config_path"]).is_absolute() or
             not isinstance(index.get("stages"), dict) or
@@ -3869,6 +3880,9 @@ def workflow_stage(operation: str, fields: dict[str, str], index: dict[str, Any]
 
 def workflow_replay_apply(index: dict[str, Any], index_path: Path,
                           pin: str, prior_sha: str) -> None:
+    prior_attempt = index.get("replay_attempt")
+    if prior_attempt and prior_attempt.get("status") != "replayed":
+        raise MaintenanceError("prior replay attempt is uncertain; refusing replay")
     config = index["config"]["apply"]
     result_path = Path(config["evidence_dir"]) / "result.json"
     lock_path = Path(config["evidence_dir"]) / "attempt.lock"
@@ -3876,7 +3890,21 @@ def workflow_replay_apply(index: dict[str, Any], index_path: Path,
         raise MaintenanceError("apply ownership or result is uncertain; refusing composite replay")
     command = [sys.executable, "-m", "tools.fork_maintenance", "apply",
                *workflow_arguments("apply", {**config, "expected_plan_sha256": pin})]
-    supervised = workflow_supervise(command)
+    index["replay_attempt"] = {
+        "status": "in_progress", "run_id": index["run_id"], "plan_sha256": pin,
+        "ordinal": (prior_attempt["ordinal"] + 1 if prior_attempt else 1),
+        "direct_rc": None, "owner_state": "unknown",
+    }
+    workflow_save_index(index_path, index, prior_sha)
+    prior_sha = sha256_bytes(index_path.read_bytes())
+    try:
+        supervised = workflow_supervise(command)
+    except BaseException as exc:
+        index["replay_attempt"]["status"] = "uncertain"
+        index["replay_attempt"]["exception_type"] = type(exc).__name__
+        # If this write fails, the already persisted in_progress marker remains sticky.
+        workflow_save_index(index_path, index, prior_sha)
+        raise MaintenanceError("outer replay supervisor failed; ownership is uncertain") from exc
     if supervised["timed_out"] and not supervised["raw_complete"]:
         response = {"status": "uncertain", "error": "outer replay timeout left incomplete evidence or owner"}
     elif supervised["timed_out"]:
@@ -3894,6 +3922,14 @@ def workflow_replay_apply(index: dict[str, Any], index_path: Path,
             response = {"status": "unparseable"}
     if (supervised["direct_rc"] == 0 and response.get("status") == "replayed" and
             supervised["raw_complete"] and supervised["group_absent_after_primary"] is True):
+        index["replay_attempt"].update({
+            "status": "replayed", "direct_rc": 0, "owner_state": "observed_complete",
+            "stdout_sha256": sha256_bytes(supervised["stdout"]),
+            "stderr_sha256": sha256_bytes(supervised["stderr"]),
+            "settlement": {key: value for key, value in supervised.items()
+                           if key not in {"stdout", "stderr"}},
+        })
+        workflow_save_index(index_path, index, prior_sha)
         return
     failure_dir = index_path.parent / f"{index['run_id']}-replay-failure"
     failure_dir.mkdir(mode=0o700, exist_ok=False)
@@ -3907,6 +3943,9 @@ def workflow_replay_apply(index: dict[str, Any], index_path: Path,
         "settlement": {key: value for key, value in supervised.items()
                        if key not in {"stdout", "stderr"}},
     }
+    index["replay_attempt"].update({"status": "uncertain",
+                                     "direct_rc": supervised["direct_rc"],
+                                     "owner_state": "outer_group_only"})
     workflow_save_index(index_path, index, prior_sha)
     raise MaintenanceError("apply replay refused; retained raw evidence requires inspection")
 
@@ -3983,7 +4022,10 @@ def workflow_currency(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "observed_config_drift", "observed_environment_drift", "observed_checkpoint_drift"
     )):
         return {"run_id": args.run_id, **workflow_project(index, True)}, EXIT_REFUSED
-    if index.get("terminal_stop") or index.get("currency_unknown") or index.get("replay_failure"):
+    if (index.get("terminal_stop") or index.get("currency_unknown") or
+            index.get("replay_failure") or
+            (index.get("replay_attempt") and
+             index["replay_attempt"].get("status") != "replayed")):
         return {"run_id": args.run_id, **workflow_project(index, True)}, EXIT_REFUSED
     config = index["config"]
     preview_fields = config.get("preview")
@@ -4028,6 +4070,7 @@ def workflow_currency(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         prior_sha = sha256_bytes(index_path.read_bytes())
         # The saved result bytes alone cannot establish the current checkout.
         workflow_replay_apply(index, index_path, index["plan_sha256"], prior_sha)
+        prior_sha = sha256_bytes(index_path.read_bytes())
         ordinal = len(index.get("currency_observations", [])) + 1
         observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         observation: dict[str, Any] = {
@@ -4151,10 +4194,16 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     "stages": index["stages"], "target_attempts": index["target_attempts"]}, code
         if args.operation == "resume" and not (
             index.get("terminal_stop") or index.get("target_invalidation") or
-            index.get("currency_unknown")
+            index.get("currency_unknown") or
+            (index.get("replay_attempt") and
+             index["replay_attempt"].get("status") != "replayed")
         ) and workflow_fixture_bindings(config) != index.get("preview_fixture_bindings", {}):
             raise MaintenanceError("workflow release fixture identity drift")
     if args.operation == "status":
+        if (index.get("replay_attempt") and
+                index["replay_attempt"].get("status") != "replayed"):
+            return {"run_id": run_id, **workflow_project(index, True),
+                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
         plan_path = Path(config["apply"]["plan"])
         observed = plan_path.exists()
         try:
@@ -4227,7 +4276,9 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
         ) for stage in ("preview", "apply")):
             return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
-        if index.get("replay_failure"):
+        if (index.get("replay_failure") or
+                (index.get("replay_attempt") and
+                 index["replay_attempt"].get("status") != "replayed")):
             return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
         if index.get("terminal_stop") or index.get("target_invalidation") or index.get("currency_unknown"):
             return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
@@ -4282,6 +4333,7 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             prior_sha = sha256_bytes(index_path.read_bytes())
         else:
             workflow_replay_apply(index, index_path, observed_pin, prior_sha)
+            prior_sha = sha256_bytes(index_path.read_bytes())
         if index.get("qualification_sidecar_sha256"):
             current = workflow_validate_sidecar(index, plan)
             if current != index["qualification_sidecar_sha256"]:

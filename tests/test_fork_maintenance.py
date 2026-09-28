@@ -662,6 +662,71 @@ def test_currency_refuses_drifted_output_without_current_receipt(tmp_path: Path)
         assert not list(case.glob(f"{state['run_id']}-currency-*.json"))
 
 
+def test_replay_supervisor_exception_sticks_before_second_public_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repos = make_repositories(tmp_path)
+    index_path, _, _, _ = release_workflow(repos, tmp_path)
+    engine = load_engine()
+    state = json.loads(index_path.read_text())
+    index = engine.workflow_load_index(index_path, state["run_id"], currency=True)
+    calls = 0
+    sentinel = tmp_path / "late-replay-sentinel"
+    real_supervise = engine.workflow_supervise
+
+    def broken_supervisor(_command: list[str]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        assert json.loads(index_path.read_text())["replay_attempt"]["status"] == "in_progress"
+        class BrokenSelector:
+            def register(self, *_args: Any) -> None:
+                raise OSError("fixture stream failure after Popen")
+
+            def close(self) -> None:
+                pass
+
+        original_selector = engine.selectors.DefaultSelector
+        engine.selectors.DefaultSelector = BrokenSelector
+        child = (
+            "import pathlib,sys,time; time.sleep(1.5); "
+            "pathlib.Path(sys.argv[1]).write_text('late')"
+        )
+        try:
+            return real_supervise([sys.executable, "-c", child, str(sentinel)], timeout=5)
+        finally:
+            engine.selectors.DefaultSelector = original_selector
+
+    monkeypatch.setattr(engine, "workflow_supervise", broken_supervisor)
+    pin = state["plan_sha256"]
+    with pytest.raises(engine.MaintenanceError, match="ownership is uncertain"):
+        engine.workflow_replay_apply(
+            index, index_path, pin, hashlib.sha256(index_path.read_bytes()).hexdigest())
+    after = json.loads(index_path.read_text())
+    assert after["replay_attempt"]["status"] == "uncertain"
+    assert after["replay_attempt"]["direct_rc"] is None
+    assert after["replay_attempt"]["owner_state"] == "unknown"
+    assert not after.get("currency_observations")
+    with pytest.raises(engine.MaintenanceError, match="prior replay attempt is uncertain"):
+        engine.workflow_replay_apply(
+            index, index_path, pin, hashlib.sha256(index_path.read_bytes()).hexdigest())
+    assert calls == 1
+    before = index_path.read_bytes()
+    status = run_cli("status", "--evidence-index", str(index_path), "--run-id", state["run_id"])
+    assert status.returncode == 0
+    assert json.loads(status.stdout)["stopped_reason"] == "replay_uncertain"
+    resume = run_cli("resume", "--evidence-index", str(index_path), "--run-id", state["run_id"])
+    assert resume.returncode == 2
+    assert json.loads(resume.stderr)["stopped_reason"] == "replay_uncertain"
+    subject, subject_pin = currency_subject(index_path, tmp_path, "publication")
+    currency = currency_call(index_path, subject, subject_pin, "publication")
+    assert currency.returncode == 2
+    assert json.loads(currency.stderr)["stopped_reason"] == "replay_uncertain"
+    assert index_path.read_bytes() == before
+    assert calls == 1
+    time.sleep(1.6)
+    assert not sentinel.exists()
+
+
 def test_workflow_wrong_pin_refuses_before_apply(tmp_path: Path) -> None:
     repos = make_repositories(tmp_path)
     plan = tmp_path / "plan.json"
