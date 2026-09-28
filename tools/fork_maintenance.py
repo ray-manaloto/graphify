@@ -3283,6 +3283,15 @@ def workflow_arguments(operation: str, fields: dict[str, str]) -> list[str]:
 
 
 def workflow_project(index: dict[str, Any], observed_plan_exists: bool | None) -> dict[str, Any]:
+    if index.get("terminal_stop"):
+        return {"status": "stopped", "next_action": "inspect_target_limit",
+                "stopped_reason": index["terminal_stop"]}
+    if index.get("currency_unknown"):
+        return {"status": "stopped", "next_action": "inspect_currency_unknown",
+                "stopped_reason": "currency_unknown"}
+    if index.get("target_invalidation"):
+        return {"status": "stopped", "next_action": "qualify_new_target",
+                "stopped_reason": "target_changed"}
     stages = index.get("stages", {})
     if not isinstance(stages, dict):
         raise MaintenanceError("workflow stages are malformed")
@@ -3309,7 +3318,7 @@ def workflow_project(index: dict[str, Any], observed_plan_exists: bool | None) -
     return {"status": "ready", "next_action": "preview", "stopped_reason": None}
 
 
-def workflow_load_index(path: Path, run_id: str) -> dict[str, Any]:
+def workflow_load_index(path: Path, run_id: str, *, currency: bool = False) -> dict[str, Any]:
     try:
         content = path.read_bytes()
         index = json.loads(content)
@@ -3340,8 +3349,22 @@ def workflow_load_index(path: Path, run_id: str) -> dict[str, Any]:
         raise MaintenanceError(f"workflow configuration unavailable: {exc}") from exc
     if sha256_bytes(current_config) != index.get("config_file_sha256"):
         raise MaintenanceError("workflow configuration file drift")
-    if workflow_fixture_bindings(config) != index.get("preview_fixture_bindings", {}):
+    if not currency and workflow_fixture_bindings(config) != index.get("preview_fixture_bindings", {}):
         raise MaintenanceError("workflow release fixture identity drift")
+    observations = index.get("currency_observations", [])
+    if not isinstance(observations, list):
+        raise MaintenanceError("workflow currency observations are malformed")
+    for reference in observations:
+        if (not isinstance(reference, dict) or
+                not isinstance(reference.get("path"), str) or
+                not Path(reference["path"]).is_absolute() or
+                not isinstance(reference.get("sha256"), str) or
+                not DIGEST_RE.fullmatch(reference["sha256"])):
+            raise MaintenanceError("workflow currency receipt reference is malformed")
+        if sha256_bytes(workflow_regular_bytes(
+            Path(reference["path"]), "workflow currency receipt"
+        )) != reference["sha256"]:
+            raise MaintenanceError("workflow currency receipt identity drift")
     return index
 
 
@@ -3529,6 +3552,198 @@ def workflow_replay_apply(index: dict[str, Any], index_path: Path,
     raise MaintenanceError("apply replay refused; retained raw evidence requires inspection")
 
 
+def workflow_regular_bytes(path: Path, label: str) -> bytes:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_HTTP_BYTES:
+            raise MaintenanceError(f"{label} is not a bounded regular file")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+                             getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            observed = os.fstat(stream.fileno())
+            if not stat.S_ISREG(observed.st_mode) or observed.st_size > MAX_HTTP_BYTES:
+                raise MaintenanceError(f"{label} changed file type or size")
+            content = stream.read(MAX_HTTP_BYTES + 1)
+    except OSError as exc:
+        raise MaintenanceError(f"{label} cannot be read: {exc}") from exc
+    if len(content) > MAX_HTTP_BYTES:
+        raise MaintenanceError(f"{label} exceeds byte limit")
+    return content
+
+
+def workflow_validate_currency_subject(boundary: str, identity: dict[str, str],
+                                       index: dict[str, Any]) -> None:
+    fields = {
+        "publication": {"result_commit", "result_tree", "gate_receipt_path",
+                        "gate_receipt_sha256", "review_receipt_path", "review_receipt_sha256"},
+        "integration": {"published_ref", "published_commit", "publication_receipt_path",
+                        "publication_receipt_sha256", "consumer_plan_path",
+                        "consumer_plan_sha256"},
+        "completion": {"consumer_result_commit", "consumer_result_path",
+                       "consumer_result_sha256"},
+    }
+    if set(identity) != fields[boundary]:
+        raise MaintenanceError("currency boundary subject identities are incomplete or unknown")
+    if boundary == "publication":
+        result = read_result(Path(index["config"]["apply"]["evidence_dir"]) / "result.json")
+        if (identity["result_commit"] != result.get("result_commit") or
+                identity["result_tree"] != result.get("result_tree")):
+            raise MaintenanceError("publication subject differs from applied output")
+        if identity["gate_receipt_path"] == identity["review_receipt_path"]:
+            raise MaintenanceError("publication gate and review receipts must be distinct")
+    if boundary == "integration":
+        result = read_result(Path(index["config"]["apply"]["evidence_dir"]) / "result.json")
+        if (identity["published_commit"] != result.get("result_commit") or
+                not identity["published_ref"].startswith(("refs/heads/", "refs/tags/")) or
+                any(char.isspace() for char in identity["published_ref"])):
+            raise MaintenanceError("integration subject does not bind applied output and immutable ref")
+    for key in ("published_commit", "consumer_result_commit"):
+        if key in identity:
+            require_sha(identity[key], f"currency {key}")
+    for key in tuple(identity):
+        if not key.endswith("_path"):
+            continue
+        digest_key = key.removesuffix("_path") + "_sha256"
+        path = Path(identity[key])
+        digest = identity[digest_key]
+        if not path.is_absolute() or not DIGEST_RE.fullmatch(digest):
+            raise MaintenanceError("currency external receipt requires absolute path and SHA-256")
+        observed = sha256_bytes(workflow_regular_bytes(path, "currency external receipt"))
+        if observed != digest:
+            raise MaintenanceError("currency external receipt identity drift")
+
+
+def workflow_currency(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """Record a diagnostic boundary observation; never promote or rewrite a plan."""
+    index_path = Path(args.evidence_index).resolve()
+    index = workflow_load_index(index_path, args.run_id, currency=True)
+    if index.get("terminal_stop") or index.get("currency_unknown"):
+        return {"run_id": args.run_id, **workflow_project(index, True)}, EXIT_REFUSED
+    config = index["config"]
+    preview_fields = config.get("preview")
+    if not preview_fields or not index.get("plan_sha256"):
+        raise MaintenanceError("currency requires a pinned workflow preview")
+    plan, _ = load_and_validate_plan(Path(config["apply"]["plan"]), index["plan_sha256"])
+    if (plan["candidate"]["commit"] != preview_fields["candidate"] or
+            plan["selection"]["target_commit"] != index["target_attempts"][0]["target_commit"]):
+        raise MaintenanceError("currency frozen candidate or initial target drift")
+    if index["stages"].get("apply", {}).get("status") not in {"applied", "replayed"}:
+        raise MaintenanceError("currency requires an applied output")
+    if index.get("qualification_sidecar_sha256"):
+        if workflow_validate_sidecar(index, plan) != index["qualification_sidecar_sha256"]:
+            raise MaintenanceError("currency sidecar identity drift")
+    elif config.get("qualification_sidecar"):
+        raise MaintenanceError("currency requires qualified capability sidecar")
+    subject_path = Path(args.subject)
+    if not subject_path.is_absolute() or not DIGEST_RE.fullmatch(args.expected_subject_sha256):
+        raise MaintenanceError("currency requires absolute subject and exact-byte SHA-256 pin")
+    subject_bytes = workflow_regular_bytes(subject_path, "currency boundary subject")
+    if sha256_bytes(subject_bytes) != args.expected_subject_sha256:
+        raise MaintenanceError("currency boundary subject identity drift")
+    subject = json.loads(subject_bytes)
+    if (not isinstance(subject, dict) or set(subject) != {
+            "schema_version", "boundary", "run_id", "plan_sha256", "target_commit", "identity"
+    } or subject.get("schema_version") != 1 or subject.get("boundary") != args.boundary or
+            subject.get("run_id") != args.run_id or
+            subject.get("plan_sha256") != index["plan_sha256"] or
+            subject.get("target_commit") != index["target_attempts"][-1]["target_commit"] or
+            not isinstance(subject.get("identity"), dict) or not subject["identity"] or
+            any(not isinstance(k, str) or not k or not isinstance(v, str) or not v
+                for k, v in subject["identity"].items())):
+        raise MaintenanceError("currency boundary subject is incomplete or mismatched")
+    workflow_validate_currency_subject(args.boundary, subject["identity"], index)
+    lock = Path(str(index_path) + ".lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise MaintenanceError("workflow ownership lock remains present") from exc
+    os.close(fd)
+    try:
+        prior_sha = sha256_bytes(index_path.read_bytes())
+        ordinal = len(index.get("currency_observations", [])) + 1
+        observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        observation: dict[str, Any] = {
+            "schema_version": 1, "run_id": args.run_id, "boundary": args.boundary,
+            "observed_at": observed_at, "subject_path": str(subject_path),
+            "subject_sha256": args.expected_subject_sha256, "subject_identity": subject["identity"],
+            "plan_sha256": index["plan_sha256"],
+            "comparison_target": index["target_attempts"][-1]["target_commit"],
+            "promotion_authorized": False,
+        }
+        runner: GitRunner | None = None
+        try:
+            if plan["selection"]["mode"] == "override":
+                observation["selection"] = plan["selection"]
+                observation["release_bindings"] = {"mode": "fixed_override"}
+            else:
+                with terminal_scratch("graphify-fork-currency-") as scratch:
+                    home = Path(scratch.path) / "home"
+                    home.mkdir()
+                    runner = GitRunner(subprocess_timeout=DEFAULT_SUBPROCESS_TIMEOUT,
+                                       deadline=time.monotonic() + DEFAULT_ATTEMPT_TIMEOUT,
+                                       home=home)
+                    currency_args = argparse.Namespace(**preview_fields)
+                    currency_args.github_releases_url = preview_fields.get(
+                        "github_releases_url",
+                        "https://api.github.com/repos/Graphify-Labs/graphify/releases?per_page=100&page=1")
+                    currency_args.pypi_base_url = preview_fields.get("pypi_base_url", "https://pypi.org")
+                    currency_args.github_releases_fixture = preview_fields.get("github_releases_fixture")
+                    currency_args.pypi_fixture = preview_fields.get("pypi_fixture")
+                    currency_args.network_timeout = 15.0
+                    currency_args.max_pages = 20
+                    selection, bindings = select_release(currency_args, runner,
+                                                         config["apply"]["upstream_url"])
+                    observation["selection"] = selection
+                    observation["release_bindings"] = bindings
+                    observation["fixture_bindings"] = workflow_fixture_bindings(config)
+        except (MaintenanceError, OSError, UnicodeError, json.JSONDecodeError,
+                subprocess.SubprocessError) as exc:
+            observation["status"] = "unknown"
+            observation["error"] = str(exc)
+        if runner is not None:
+            command_dir = index_path.parent / f"{args.run_id}-currency-{ordinal}-commands"
+            persist_command_evidence(runner.records, command_dir, time.monotonic() + 30)
+            observation["command_records"] = runner.records
+        if observation.get("status") != "unknown":
+            target = observation["selection"]["target_commit"]
+            comparison = observation["comparison_target"]
+            compared_release = index["target_attempts"][-1].get(
+                "release", plan["selection"].get("release"))
+            observation["comparison_release"] = compared_release
+            observation["status"] = (
+                "current" if target == comparison and
+                observation["selection"].get("release") == compared_release else "changed"
+            )
+        observation_path = index_path.parent / f"{args.run_id}-currency-{ordinal}.json"
+        exclusive_write_bytes(observation_path, json_file_bytes(observation))
+        reference = {"path": str(observation_path),
+                     "sha256": sha256_bytes(observation_path.read_bytes()),
+                     "boundary": args.boundary, "status": observation["status"],
+                     "subject_sha256": args.expected_subject_sha256}
+        index.setdefault("currency_observations", []).append(reference)
+        if observation["status"] == "unknown":
+            index["currency_unknown"] = reference
+        if observation["status"] == "changed":
+            target = observation["selection"]["target_commit"]
+            index["target_invalidation"] = {
+                "observation": reference, "invalidates": ["plan", "apply", "qualification_sidecar"],
+                "approval_pin_required": True,
+            }
+            if len(index["target_attempts"]) >= 3:
+                index["terminal_stop"] = "target_attempt_limit_exhausted"
+            else:
+                index["target_attempts"].append({"target_commit": target,
+                                                  "release": observation["selection"].get("release"),
+                                                  "required_by": reference,
+                                                  "plan_sha256": None})
+        workflow_save_index(index_path, index, prior_sha)
+        code = 0 if observation["status"] == "current" and not index.get("target_invalidation") else EXIT_REFUSED
+        return {"run_id": args.run_id, "currency": reference,
+                **workflow_project(index, True), "target_attempts": index["target_attempts"]}, code
+    finally:
+        os.unlink(lock)
+
+
 def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     index_path = Path(args.evidence_index).resolve()
     if args.operation == "run":
@@ -3554,11 +3769,36 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         exclusive_write_bytes(index_path, workflow_index_bytes(index))
     else:
         run_id = args.run_id
-        index = workflow_load_index(index_path, run_id)
+        index = workflow_load_index(index_path, run_id, currency=True)
         config = index["config"]
+        if args.operation == "resume" and not (
+            index.get("terminal_stop") or index.get("target_invalidation") or
+            index.get("currency_unknown")
+        ) and workflow_fixture_bindings(config) != index.get("preview_fixture_bindings", {}):
+            raise MaintenanceError("workflow release fixture identity drift")
     if args.operation == "status":
         plan_path = Path(config["apply"]["plan"])
         observed = plan_path.exists()
+        try:
+            observed_fixtures = workflow_fixture_bindings(config)
+            fixtures_current = observed_fixtures == index.get("preview_fixture_bindings", {})
+            if not fixtures_current and index.get("currency_observations"):
+                latest = index["currency_observations"][-1]
+                latest_receipt = json.loads(workflow_regular_bytes(
+                    Path(latest["path"]), "currency observation"))
+                fixtures_current = (
+                    latest_receipt.get("status") == "current" and
+                    latest_receipt.get("fixture_bindings") == observed_fixtures
+                )
+        except (MaintenanceError, OSError):
+            fixtures_current = False
+        if not fixtures_current and not (
+            index.get("target_invalidation") or index.get("currency_unknown") or
+            index.get("terminal_stop")
+        ):
+            return {"run_id": run_id, "status": "stopped",
+                    "next_action": "recheck_currency", "stopped_reason": "release_fixture_drift",
+                    "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
         if index.get("plan_sha256") and (
             not observed or sha256_bytes(plan_path.read_bytes()) != index["plan_sha256"]
         ):
@@ -3606,6 +3846,8 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
         if index.get("replay_failure"):
             return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
+        if index.get("terminal_stop") or index.get("target_invalidation") or index.get("currency_unknown"):
+            return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
         if not plan_path.exists() and "preview" not in stages:
             if "preview" not in config:
                 raise MaintenanceError("plan absent and preview inputs unavailable")
@@ -3633,6 +3875,7 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         index["plan_sha256"] = observed_pin
         if not index["target_attempts"]:
             index["target_attempts"].append({"target_commit": plan["selection"]["target_commit"],
+                                             "release": plan["selection"].get("release"),
                                              "plan_sha256": observed_pin})
         if "apply" not in stages:
             receipt = workflow_stage("apply", {**config["apply"],
@@ -3704,6 +3947,14 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--evidence-index", required=True)
     status_parser.add_argument("--run-id", required=True)
     status_parser.add_argument("--json", action="store_true")
+    currency_parser = subparsers.add_parser(
+        "currency", help="record a bounded diagnostic boundary currency observation")
+    currency_parser.add_argument("--evidence-index", required=True)
+    currency_parser.add_argument("--run-id", required=True)
+    currency_parser.add_argument("--boundary", choices=("publication", "integration", "completion"),
+                                 required=True)
+    currency_parser.add_argument("--subject", required=True)
+    currency_parser.add_argument("--expected-subject-sha256", required=True)
     return parser
 
 
@@ -3718,9 +3969,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = build_parser().parse_args(argv)
     except TerminalTransportError:
         return EXIT_REFUSED
-    if args.operation in {"run", "resume", "status"}:
+    if args.operation in {"run", "resume", "status", "currency"}:
         try:
-            outcome, code = workflow_execute(args)
+            outcome, code = workflow_currency(args) if args.operation == "currency" else workflow_execute(args)
         except (MaintenanceError, OSError, UnicodeError, json.JSONDecodeError,
                 subprocess.SubprocessError) as exc:
             outcome = {"status": "refused", "error": str(exc)}

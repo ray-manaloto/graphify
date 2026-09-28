@@ -211,6 +211,7 @@ def test_help_exposes_preview_apply_and_bounded_workflow_operations() -> None:
     assert "run" in result.stdout
     assert "resume" in result.stdout
     assert "status" in result.stdout
+    assert "currency" in result.stdout
     assert "frozen" in result.stdout.lower()
 
 
@@ -234,6 +235,221 @@ def workflow_fixture(repos: dict[str, Any], tmp_path: Path, plan: Path,
         config["expected_plan_sha256"] = pin
     config_path.write_text(json.dumps(config), encoding="utf-8")
     return config_path, index_path, output, evidence
+
+
+def currency_subject(index: Path, tmp_path: Path, boundary: str) -> tuple[Path, str]:
+    state = json.loads(index.read_text())
+    subject = tmp_path / f"{boundary}-subject.json"
+    receipt = tmp_path / f"{boundary}-external-receipt.json"
+    receipt.write_text(json.dumps({"boundary": boundary, "fixture": True}), encoding="utf-8")
+    receipt_sha = hashlib.sha256(receipt.read_bytes()).hexdigest()
+    if boundary == "publication":
+        result = json.loads((Path(state["config"]["apply"]["evidence_dir"]) / "result.json").read_text())
+        review = tmp_path / "publication-review-receipt.json"
+        review.write_text(json.dumps({"boundary": boundary, "fixture_review": True}), encoding="utf-8")
+        identity = {
+            "result_commit": result["result_commit"], "result_tree": result["result_tree"],
+            "gate_receipt_path": str(receipt), "gate_receipt_sha256": receipt_sha,
+            "review_receipt_path": str(review),
+            "review_receipt_sha256": hashlib.sha256(review.read_bytes()).hexdigest(),
+        }
+    elif boundary == "integration":
+        result = json.loads((Path(state["config"]["apply"]["evidence_dir"]) / "result.json").read_text())
+        identity = {
+            "published_ref": "refs/heads/fixture", "published_commit": result["result_commit"],
+            "publication_receipt_path": str(receipt), "publication_receipt_sha256": receipt_sha,
+            "consumer_plan_path": str(receipt), "consumer_plan_sha256": receipt_sha,
+        }
+    else:
+        identity = {
+            "consumer_result_commit": state["target_attempts"][-1]["target_commit"],
+            "consumer_result_path": str(receipt), "consumer_result_sha256": receipt_sha,
+        }
+    subject.write_text(json.dumps({
+        "schema_version": 1, "boundary": boundary, "run_id": state["run_id"],
+        "plan_sha256": state["plan_sha256"],
+        "target_commit": state["target_attempts"][-1]["target_commit"],
+        "identity": identity,
+    }), encoding="utf-8")
+    return subject, hashlib.sha256(subject.read_bytes()).hexdigest()
+
+
+def currency_call(index: Path, subject: Path, pin: str, boundary: str) -> subprocess.CompletedProcess[str]:
+    state = json.loads(index.read_text())
+    return run_cli("currency", "--evidence-index", str(index), "--run-id", state["run_id"],
+                   "--boundary", boundary, "--subject", str(subject),
+                   "--expected-subject-sha256", pin)
+
+
+def release_workflow(repos: dict[str, Any], tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    plan = tmp_path / "plan.json"
+    config, index, output, evidence = workflow_fixture(repos, tmp_path, plan, None)
+    releases = tmp_path / "releases.json"
+    pypi = tmp_path / "pypi.json"
+    releases.write_text(json.dumps({"pages": [[{
+        "tag_name": "v1.1.0", "published_at": "2026-09-28T12:00:00Z",
+        "draft": False, "prerelease": False,
+    }]]}), encoding="utf-8")
+    pypi.write_text(json.dumps({"1.1.0": {"urls": [
+        {"url": "https://files.invalid/graphifyy.whl", "yanked": False}
+    ]}}), encoding="utf-8")
+    payload = json.loads(config.read_text())
+    payload["preview"] = {
+        "source_repo": str(repos["source"]), "candidate": repos["candidate"],
+        "upstream_repository": "Graphify-Labs/graphify", "upstream_url": str(repos["upstream"]),
+        "output_plan": str(plan), "github_releases_fixture": str(releases),
+        "pypi_fixture": str(pypi),
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    started = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert started.returncode == 2, started.stderr
+    assert json.loads(started.stderr)["next_action"] == "supply_external_plan_pin"
+    pin = hashlib.sha256(plan.read_bytes()).hexdigest()
+    state = json.loads(index.read_text())
+    resumed = run_cli("resume", "--evidence-index", str(index), "--run-id", state["run_id"],
+                      "--expected-plan-sha256", pin)
+    assert resumed.returncode == 2, resumed.stderr
+    assert json.loads(resumed.stderr)["next_action"] == "qualify_capabilities"
+    return index, plan, releases, pypi
+
+
+def test_currency_same_release_at_each_boundary_is_diagnostic_only(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    index, plan, releases, _ = release_workflow(repos, tmp_path)
+    frozen = plan.read_bytes()
+    for boundary in ("publication", "integration", "completion"):
+        subject, pin = currency_subject(index, tmp_path, boundary)
+        before_subject = subject.read_bytes()
+        observed = currency_call(index, subject, pin, boundary)
+        assert observed.returncode == 0, observed.stderr
+        response = json.loads(observed.stdout)
+        receipt = json.loads(Path(response["currency"]["path"]).read_text())
+        assert receipt["status"] == "current"
+        assert receipt["subject_sha256"] == pin
+        assert receipt["promotion_authorized"] is False
+        assert receipt["selection"]["release"]["tag"] == "v1.1.0"
+        assert subject.read_bytes() == before_subject
+        assert plan.read_bytes() == frozen
+    state = json.loads(index.read_text())
+    assert len(state["target_attempts"]) == 1
+    assert len(state["currency_observations"]) == 3
+    releases.write_text(releases.read_text() + "\n", encoding="utf-8")
+    subject, subject_pin = currency_subject(index, tmp_path, "publication")
+    rechecked = currency_call(index, subject, subject_pin, "publication")
+    assert rechecked.returncode == 0, rechecked.stderr
+    status = run_cli("status", "--evidence-index", str(index), "--run-id", state["run_id"])
+    assert status.returncode == 0
+    assert json.loads(status.stdout)["next_action"] == "qualify_capabilities"
+    subject, subject_pin = currency_subject(index, tmp_path, "publication")
+    external = Path(json.loads(subject.read_text())["identity"]["gate_receipt_path"])
+    before = index.read_bytes()
+    external.write_text("drifted gate receipt", encoding="utf-8")
+    refused = currency_call(index, subject, subject_pin, "publication")
+    assert refused.returncode == 2
+    assert "external receipt identity drift" in json.loads(refused.stderr)["error"]
+    assert index.read_bytes() == before
+
+
+def test_currency_changed_release_preserves_plan_and_bounds_attempts(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    index, plan, releases, pypi = release_workflow(repos, tmp_path)
+    frozen = plan.read_bytes()
+    state = json.loads(index.read_text())
+    result_path = Path(state["config"]["apply"]["evidence_dir"]) / "result.json"
+    applied = result_path.read_bytes()
+    for ordinal, tag in enumerate(("v1.2.0", "v1.3.0", "v1.4.0"), 2):
+        version = tag[1:]
+        releases.write_text(json.dumps({"pages": [[{
+            "tag_name": tag, "published_at": f"2026-09-28T{10 + ordinal}:00:00Z",
+            "draft": False, "prerelease": False,
+        }]]}), encoding="utf-8")
+        pypi.write_text(json.dumps({version: {"urls": [
+            {"url": "https://files.invalid/graphifyy.whl", "yanked": False}
+        ]}}), encoding="utf-8")
+        subject, pin = currency_subject(index, tmp_path, "publication")
+        observed = currency_call(index, subject, pin, "publication")
+        assert observed.returncode == 2, observed.stdout
+        response = json.loads(observed.stderr)
+        receipt = json.loads(Path(response["currency"]["path"]).read_text())
+        assert receipt["status"] == "changed"
+        assert receipt["selection"]["release"]["tag"] == tag
+        assert receipt["promotion_authorized"] is False
+        current = json.loads(index.read_text())
+        assert len(current["target_attempts"]) == min(ordinal, 3)
+        assert plan.read_bytes() == frozen
+        assert result_path.read_bytes() == applied
+        if ordinal == 2:
+            repeat_subject, repeat_pin = currency_subject(index, tmp_path, "integration")
+            repeated = currency_call(index, repeat_subject, repeat_pin, "integration")
+            assert repeated.returncode == 2
+            assert json.loads(Path(json.loads(repeated.stderr)["currency"]["path"]).read_text())[
+                "status"] == "current"
+            assert len(json.loads(index.read_text())["target_attempts"]) == 2
+    assert current["terminal_stop"] == "target_attempt_limit_exhausted"
+    before = index.read_bytes()
+    subject, pin = currency_subject(index, tmp_path, "publication")
+    stopped = currency_call(index, subject, pin, "publication")
+    assert stopped.returncode == 2
+    assert index.read_bytes() == before
+    resumed = run_cli("resume", "--evidence-index", str(index), "--run-id", current["run_id"])
+    assert resumed.returncode == 2
+    assert json.loads(resumed.stderr)["stopped_reason"] == "target_attempt_limit_exhausted"
+
+
+def test_currency_unknown_metadata_stops_with_receipt_without_new_attempt(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    index, _, releases, _ = release_workflow(repos, tmp_path)
+    releases.write_text("{bad json", encoding="utf-8")
+    subject, pin = currency_subject(index, tmp_path, "integration")
+    observed = currency_call(index, subject, pin, "integration")
+    assert observed.returncode == 2
+    response = json.loads(observed.stderr)
+    receipt = json.loads(Path(response["currency"]["path"]).read_text())
+    assert receipt["status"] == "unknown"
+    assert receipt["promotion_authorized"] is False
+    state = json.loads(index.read_text())
+    assert len(state["target_attempts"]) == 1
+    assert state["currency_unknown"] == response["currency"]
+    before = index.read_bytes()
+    refused = currency_call(index, subject, pin, "integration")
+    assert refused.returncode == 2
+    assert index.read_bytes() == before
+    resumed = run_cli("resume", "--evidence-index", str(index), "--run-id", state["run_id"])
+    assert resumed.returncode == 2
+    assert json.loads(resumed.stderr)["stopped_reason"] == "currency_unknown"
+
+
+def test_currency_override_stays_fixed_and_receipt_drift_is_refused(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    plan = tmp_path / "plan.json"
+    assert preview_override(repos, plan).returncode == 0
+    pin = hashlib.sha256(plan.read_bytes()).hexdigest()
+    config, index, _, _ = workflow_fixture(repos, tmp_path, plan, pin)
+    payload = json.loads(config.read_text())
+    payload["preview"] = {
+        "source_repo": str(repos["source"]), "candidate": repos["candidate"],
+        "upstream_repository": "Graphify-Labs/graphify", "upstream_url": str(repos["upstream"]),
+        "output_plan": str(plan), "override_sha": repos["target"],
+        "override_reason": "bounded fixture target",
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    started = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert started.returncode == 2
+    subject, subject_pin = currency_subject(index, tmp_path, "completion")
+    observed = currency_call(index, subject, subject_pin, "completion")
+    assert observed.returncode == 0, observed.stderr
+    response = json.loads(observed.stdout)
+    receipt_path = Path(response["currency"]["path"])
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["selection"]["override"]["reason"] == "bounded fixture target"
+    assert receipt["release_bindings"]["mode"] == "fixed_override"
+    before = index.read_bytes()
+    receipt_path.write_text(receipt_path.read_text() + " ", encoding="utf-8")
+    refused = run_cli("status", "--evidence-index", str(index),
+                      "--run-id", json.loads(before)["run_id"])
+    assert refused.returncode == 2
+    assert "currency receipt identity drift" in json.loads(refused.stderr)["error"]
+    assert index.read_bytes() == before
 
 
 def test_workflow_requires_external_pin_before_any_apply_mutation(tmp_path: Path) -> None:
