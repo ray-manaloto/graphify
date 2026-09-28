@@ -1436,6 +1436,25 @@ def test_graph_has_legacy_ids_detects_old_scheme():
     assert graph_has_legacy_ids(go_symbol, root=".") is False
 
 
+def test_graph_has_legacy_ids_checks_local_id_in_merged_graph():
+    """A repo namespace does not turn a current file ID into an old stem."""
+    from graphify.build import graph_has_legacy_ids
+
+    source_file = "homebrew/firecrawl-cli.rb"
+    current = "homebrew_firecrawl_cli_firecrawlcli"
+    node = {
+        "id": f"firecrawl-cli::{current}",
+        "repo": "firecrawl-cli",
+        "local_id": current,
+        "source_file": source_file,
+        "source_location": "L1",
+    }
+    assert graph_has_legacy_ids([node], root=".") is False
+
+    stale = {**node, "id": "firecrawl-cli::firecrawl_cli", "local_id": "firecrawl_cli"}
+    assert graph_has_legacy_ids([stale], root=".") is True
+
+
 # ── #2408: globally-scoped MCP node ids are not file-stem derived ──────────────
 
 @pytest.mark.parametrize("mcp_kind, nid", [
