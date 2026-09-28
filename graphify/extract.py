@@ -51,7 +51,7 @@ from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
-from graphify.extractors.markdown import extract_markdown, _MD_LINK_INDEX_CACHE  # noqa: F401
+from graphify.extractors.markdown import extract_markdown, _MD_LINK_INDEX_CACHE, _MD_LINKABLE_EXTS, _build_link_index  # noqa: F401
 from graphify.extractors.ocaml import extract_ocaml  # noqa: F401
 from graphify.extractors.pascal_forms import extract_delphi_form, extract_lazarus_form  # noqa: F401
 from graphify.extractors.powershell import extract_powershell, extract_powershell_manifest  # noqa: F401
@@ -6274,7 +6274,28 @@ def _xaml_pascal_name(name: str) -> str | None:
 _XAML_TOOLKIT_FIELD_RE = re.compile(r"\b(?P<name>_?m?_?[A-Za-z_]\w*)\s*(?:=.*)?;")
 _XAML_TOOLKIT_METHOD_RE = re.compile(r"\b(?P<name>[A-Za-z_]\w*)\s*\(")
 _XAML_ACTIVE_EXTRACT_ROOT: Path | None = None
+_ACTIVE_EXTRACT_EXCLUDES: list[str] | None = None
+_ACTIVE_EXTRACT_GITIGNORE = True
 _XAML_CSHARP_CLASS_CACHE: dict[str, dict[str, list[dict]]] = {}
+
+
+def _markdown_cache_fingerprint(
+    root: Path, extra_excludes: list[str] | None, gitignore: bool,
+) -> str | None:
+    """Key Markdown AST cache entries to the current linkable corpus."""
+    try:
+        index = _build_link_index(
+            root, extra_excludes=extra_excludes, gitignore=gitignore,
+        )
+    except OSError:
+        return None
+    _MD_LINK_INDEX_CACHE[str(root)] = index
+    digest = hashlib.sha256()
+    for basename in sorted(index):
+        for _, relative, _ in sorted(index[basename]):
+            digest.update(relative.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+    return digest.hexdigest()[:20]
 
 
 def _xaml_communitytoolkit_members(vm_node: dict) -> tuple[dict[str, dict], list[dict]]:
@@ -6898,14 +6919,23 @@ def _get_extractor(path: Path) -> Any | None:
     return _DISPATCH.get(suffix)
 
 
-def _safe_extract_with_xaml_root(extractor, path: Path, root: Path) -> dict:
-    global _XAML_ACTIVE_EXTRACT_ROOT
+def _safe_extract_with_xaml_root(
+    extractor, path: Path, root: Path,
+    extra_excludes: list[str] | None = None, gitignore: bool = True,
+) -> dict:
+    global _XAML_ACTIVE_EXTRACT_ROOT, _ACTIVE_EXTRACT_EXCLUDES, _ACTIVE_EXTRACT_GITIGNORE
     previous_root = _XAML_ACTIVE_EXTRACT_ROOT
+    previous_excludes = _ACTIVE_EXTRACT_EXCLUDES
+    previous_gitignore = _ACTIVE_EXTRACT_GITIGNORE
     _XAML_ACTIVE_EXTRACT_ROOT = root.resolve()
+    _ACTIVE_EXTRACT_EXCLUDES = extra_excludes
+    _ACTIVE_EXTRACT_GITIGNORE = gitignore
     try:
         return _safe_extract(extractor, path, scan_root=root)
     finally:
         _XAML_ACTIVE_EXTRACT_ROOT = previous_root
+        _ACTIVE_EXTRACT_EXCLUDES = previous_excludes
+        _ACTIVE_EXTRACT_GITIGNORE = previous_gitignore
 
 
 def _extract_single_file(args: tuple) -> tuple[int, dict]:
@@ -6915,28 +6945,41 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     ProcessPoolExecutor.
 
     Args:
-        args: (index, path_str, root_str, cache_location_str) tuple. ``root``
-            anchors hash keys / node ids / the XAML boundary; ``cache_location``
-            is where the cache dir is written, decoupled per #1774. A legacy
-            3-tuple (no cache_location) is still accepted for back-compat.
+        args: index, path, root, cache location, ignore options, and Markdown
+            corpus fingerprint. ``root`` anchors ids; ``cache_location`` is
+            where cache entries are written. Legacy tuples remain accepted.
 
     Returns:
         (index, result_dict) so results can be placed back in order.
     """
-    if len(args) == 4:
+    if len(args) == 7:
+        idx, path_str, root_str, cache_location_str, extra_excludes, gitignore, md_fp = args
+    elif len(args) == 6:
+        idx, path_str, root_str, cache_location_str, extra_excludes, gitignore = args
+        md_fp = None
+    elif len(args) == 4:
         idx, path_str, root_str, cache_location_str = args
+        extra_excludes, gitignore = None, True
+        md_fp = None
     else:  # legacy 3-tuple: location == anchor
         idx, path_str, root_str = args
         cache_location_str = root_str
+        extra_excludes, gitignore = None, True
+        md_fp = None
     path = Path(path_str)
     root = Path(root_str)
     cache_location = Path(cache_location_str)
     _raise_recursion_limit()
-    bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
+    markdown = path.suffix.lower() in _MD_LINKABLE_EXTS
+    bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES or (markdown and md_fp is None)
 
     # Check cache first (avoid re-extraction)
     if not bypass_cache:
-        cached = load_cached(path, root, cache_root=cache_location)
+        cached = load_cached(
+            path, root, cache_root=cache_location,
+            compatibility_fp=md_fp if markdown else None,
+            allow_legacy=not markdown,
+        )
         if cached is not None:
             return idx, cached
 
@@ -6944,14 +6987,19 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     if extractor is None:
         return idx, {"nodes": [], "edges": []}
 
-    result = _safe_extract_with_xaml_root(extractor, path, root)
+    result = _safe_extract_with_xaml_root(
+        extractor, path, root, extra_excludes, gitignore,
+    )
     # Never cache a zero-node result for an extractable file. Every supported
     # source produces at least a file node, so an empty node list is anomalous
     # (e.g. a transient batch/parallel hiccup). Caching it makes the empty
     # byte-stable across runs and silently blinds affected/explain to and
     # through the file (#1666); skipping the write lets a rerun self-heal.
     if not bypass_cache and "error" not in result and result.get("nodes"):
-        save_cached(path, result, root, cache_root=cache_location)
+        save_cached(
+            path, result, root, cache_root=cache_location,
+            compatibility_fp=md_fp if markdown else None,
+        )
     return idx, result
 
 
@@ -6990,6 +7038,9 @@ def _extract_parallel(
     max_workers: int | None,
     total_files: int,
     cache_location: Path | None = None,
+    extra_excludes: list[str] | None = None,
+    gitignore: bool = True,
+    md_fp: str | None = None,
 ) -> bool:
     """Extract uncached files in parallel using ProcessPoolExecutor.
 
@@ -7039,7 +7090,10 @@ def _extract_parallel(
     # the cache dir is written (defaults to root when not decoupled) (#1774).
     root_str = str(root)
     cache_loc_str = str(cache_location if cache_location is not None else root)
-    work_items = [(idx, str(path), root_str, cache_loc_str) for idx, path in uncached_work]
+    work_items = [
+        (idx, str(path), root_str, cache_loc_str, extra_excludes, gitignore, md_fp)
+        for idx, path in uncached_work
+    ]
 
     done_count = 0
     failed: list[int] = []  # positions into uncached_work whose future failed
@@ -7111,7 +7165,8 @@ def _extract_parallel(
         # a second failure into an error-carrying result.
         _extract_sequential(
             [uncached_work[pos] for pos in failed],
-            per_file, root, total_files, cache_location,
+            per_file, root, total_files, cache_location, extra_excludes, gitignore,
+            md_fp,
         )
     if total_files >= _PROGRESS_INTERVAL:
         # Report the same denominator the intermediate lines used (uncached files
@@ -7132,6 +7187,9 @@ def _extract_sequential(
     root: Path,
     total_files: int,
     cache_location: Path | None = None,
+    extra_excludes: list[str] | None = None,
+    gitignore: bool = True,
+    md_fp: str | None = None,
 ) -> None:
     """Extract uncached files sequentially (fallback for small batches)."""
     _PROGRESS_INTERVAL = 100
@@ -7149,12 +7207,18 @@ def _extract_sequential(
         if extractor is None:
             per_file[idx] = {"nodes": [], "edges": []}
             continue
-        bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
+        markdown = path.suffix.lower() in _MD_LINKABLE_EXTS
+        bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES or (markdown and md_fp is None)
         # XAML boundary anchors on `root` (the corpus), not the cache location.
-        result = _safe_extract_with_xaml_root(extractor, path, root)
+        result = _safe_extract_with_xaml_root(
+            extractor, path, root, extra_excludes, gitignore,
+        )
         # See _extract_single_file: don't cache an anomalous zero-node result (#1666).
         if not bypass_cache and "error" not in result and result.get("nodes"):
-            save_cached(path, result, root, cache_root=cache_location)
+            save_cached(
+                path, result, root, cache_root=cache_location,
+                compatibility_fp=md_fp if markdown else None,
+            )
         per_file[idx] = result
     if total_files >= _PROGRESS_INTERVAL:
         # Consistent denominator with the intermediate lines (#1693).
@@ -7174,6 +7238,8 @@ def extract(
     max_workers: int | None = None,
     resolution_context_nodes: list[dict] | None = None,
     resolution_context_edges: list[dict] | None = None,
+    extra_excludes: list[str] | None = None,
+    gitignore: bool = True,
 ) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -7213,6 +7279,9 @@ def extract(
             Read-only, same contract as
             resolution_context_nodes: they widen the resolvers' view but only
             fresh results are appended to the returned nodes/edges.
+        extra_excludes: scanner's effective --exclude patterns. Markdown
+            links must resolve against the same corpus as detect().
+        gitignore: scanner's effective .gitignore setting.
     """
     paths = [Path(p) for p in paths]
     anchor_root = Path(root) if root is not None else None
@@ -7265,6 +7334,13 @@ def extract(
     elif cache_root is not None:
         root = cache_root
     root = root.resolve()
+    # A Markdown result depends on the set of linkable targets as well as the
+    # source bytes. Namespace its AST cache by that live, ignore-aware set.
+    md_fp = (
+        _markdown_cache_fingerprint(root, extra_excludes, gitignore)
+        if any(path.suffix.lower() in _MD_LINKABLE_EXTS for path in paths)
+        else None
+    )
     python_scan_paths = list(paths)
     for context_node in resolution_context_nodes or []:
         source_file = context_node.get("source_file")
@@ -7301,9 +7377,14 @@ def extract(
         if _get_extractor(path) is None:
             per_file[i] = {"nodes": [], "edges": []}
             continue
-        bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
+        markdown = path.suffix.lower() in _MD_LINKABLE_EXTS
+        bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES or (markdown and md_fp is None)
         if not bypass_cache:
-            cached = load_cached(path, root, cache_root=cache_location)
+            cached = load_cached(
+                path, root, cache_root=cache_location,
+                compatibility_fp=md_fp if markdown else None,
+                allow_legacy=not markdown,
+            )
             if cached is not None:
                 per_file[i] = cached
                 continue
@@ -7334,7 +7415,8 @@ def extract(
         ran_parallel = False
         if parallel and len(uncached_work) >= _PARALLEL_THRESHOLD:
             ran_parallel = _extract_parallel(
-                uncached_work, per_file, root, max_workers, total, cache_location
+                uncached_work, per_file, root, max_workers, total, cache_location,
+                extra_excludes, gitignore, md_fp,
             )
         if not ran_parallel:
             # #2444: only re-extract what the pool didn't finish. A pool that
@@ -7342,7 +7424,8 @@ def extract(
             # the whole batch would throw that work away.
             _extract_sequential(
                 [(i, p) for (i, p) in uncached_work if per_file[i] is None],
-                per_file, root, total, cache_location,
+                per_file, root, total, cache_location, extra_excludes, gitignore,
+                md_fp,
             )
 
     # Fill any remaining None slots. With the #2444/#2445 handling above this

@@ -1884,6 +1884,8 @@ def _rebuild_code(
         result = extract(
             extract_targets,
             cache_root=watch_root,
+            extra_excludes=_persisted_excludes or None,
+            gitignore=_gitignore_enabled,
             resolution_context_nodes=resolution_context_nodes or None,
             resolution_context_edges=resolution_context_edges or None,
         ) if extract_targets else {

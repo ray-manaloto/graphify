@@ -6,6 +6,7 @@ import os
 import unicodedata
 
 from pathlib import Path
+from typing import Callable
 from graphify.detect import CODE_EXTENSIONS, DOC_EXTENSIONS
 from graphify.extractors.base import _file_stem, _make_id
 from graphify.security import sanitize_metadata
@@ -137,13 +138,23 @@ def _active_scan_root() -> "Path | None":
     return getattr(_extract, "_XAML_ACTIVE_EXTRACT_ROOT", None)
 
 
+def _active_ignore_options() -> "tuple[list[str] | None, bool]":
+    import graphify.extract as _extract
+    return (
+        getattr(_extract, "_ACTIVE_EXTRACT_EXCLUDES", None),
+        getattr(_extract, "_ACTIVE_EXTRACT_GITIGNORE", True),
+    )
+
+
 def _nfc(s: str) -> str:
     # Filesystems disagree on Unicode normalization (macOS decomposes, others
     # do not); a link typed in NFC must still find a file listed in NFD.
     return unicodedata.normalize("NFC", s)
 
 
-def _build_link_index(root: Path) -> "dict[str, list[tuple[int, str, Path]]]":
+def _build_link_index(
+    root: Path, *, extra_excludes: list[str] | None = None, gitignore: bool = True,
+) -> "dict[str, list[tuple[int, str, Path]]]":
     """Index every linkable document under *root* by NFC-normalized basename.
 
     Each entry maps basename -> [(depth, root-relative posix path, absolute
@@ -154,7 +165,7 @@ def _build_link_index(root: Path) -> "dict[str, list[tuple[int, str, Path]]]":
     """
     from graphify.detect import _SKIP_DIRS, ignored_predicate
     root = Path(root)
-    ignored = ignored_predicate(root)
+    ignored = ignored_predicate(root, extra_excludes=extra_excludes, gitignore=gitignore)
     index: dict[str, list[tuple[int, str, Path]]] = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dp = Path(dirpath)
@@ -189,7 +200,8 @@ def _vault_lookup(target: str, root: Path) -> "Path | None":
     index = _MD_LINK_INDEX_CACHE.get(root_key)
     if index is None:
         try:
-            index = _build_link_index(root)
+            excludes, gitignore = _active_ignore_options()
+            index = _build_link_index(root, extra_excludes=excludes, gitignore=gitignore)
         except OSError:
             index = {}
         _MD_LINK_INDEX_CACHE[root_key] = index
@@ -207,8 +219,10 @@ def _vault_lookup(target: str, root: Path) -> "Path | None":
     return min(matches)[2]
 
 
-def _resolve_markdown_link(raw: str, source_dir: Path,
-                           wikilink: bool = False) -> "Path | None":
+def _resolve_markdown_link(
+    raw: str, source_dir: Path, wikilink: bool = False,
+    ignored: Callable[[Path], bool] | None = None,
+) -> "Path | None":
     """Resolve a markdown link target to the absolute path of a sibling document.
 
     Returns the resolved (normalized, not necessarily existing) path when the
@@ -249,7 +263,7 @@ def _resolve_markdown_link(raw: str, source_dir: Path,
     resolved = Path(os.path.normpath(str(candidate)))
     if wikilink and not Path(target).is_absolute():
         try:
-            missing = not resolved.is_file()
+            missing = not resolved.is_file() or (ignored is not None and ignored(resolved))
         except OSError:
             missing = False
         if missing:
@@ -258,6 +272,10 @@ def _resolve_markdown_link(raw: str, source_dir: Path,
                 hit = _vault_lookup(target, scan_root)
                 if hit is not None:
                     return Path(os.path.normpath(str(hit)))
+            if ignored is not None and ignored(resolved):
+                return None
+    if ignored is not None and resolved.is_file() and ignored(resolved):
+        return None
     return resolved
 
 def _code_span_mention(span: str) -> "tuple[str | None, list[str]] | None":
@@ -413,12 +431,22 @@ def extract_markdown(path: Path) -> dict:
              extra={"frontmatter": frontmatter} if frontmatter else None)
 
     source_dir = path.parent
+    scan_root = _active_scan_root()
+    ignored = None
+    if scan_root is not None:
+        from graphify.detect import ignored_predicate
+        excludes, gitignore = _active_ignore_options()
+        ignored = ignored_predicate(
+            scan_root, extra_excludes=excludes, gitignore=gitignore,
+        )
     # Dedup link edges by resolved target node so a hub doc that links to the
     # same sibling many times yields one edge, not N (keeps weights meaningful).
     linked_targets: set[str] = set()
 
     def add_link(raw: str, line: int, wikilink: bool = False) -> None:
-        resolved = _resolve_markdown_link(raw, source_dir, wikilink=wikilink)
+        resolved = _resolve_markdown_link(
+            raw, source_dir, wikilink=wikilink, ignored=ignored,
+        )
         if resolved is None:
             return
         # Build the target ID with the SAME recipe as the target file's own

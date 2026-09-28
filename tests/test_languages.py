@@ -3339,6 +3339,39 @@ def test_markdown_wikilink_index_prunes_ignored_directories(tmp_path, monkeypatc
     assert not any("bigdata" in e["target"] for e in refs), f"wikilink resolved into ignored path: {refs}"
 
 
+def test_markdown_existing_sibling_wikilink_respects_graphifyignore(tmp_path):
+    """An existing sibling must not bypass the scanner's ignore boundary."""
+    from graphify.extract import extract
+
+    source = tmp_path / "entry.md"
+    source.write_text("See [[secret]].\n", encoding="utf-8")
+    (tmp_path / "secret.md").write_text("# Secret\n", encoding="utf-8")
+    (tmp_path / ".graphifyignore").write_text("secret.md\n", encoding="utf-8")
+
+    graph = extract([source], root=tmp_path, cache_root=tmp_path, parallel=False)
+    assert not [edge for edge in graph["edges"] if edge["relation"] == "references"]
+
+
+def test_markdown_wikilink_excludes_follow_scan_options_without_stale_cache(tmp_path):
+    """A changed --exclude must affect link resolution even with unchanged Markdown."""
+    from graphify.extract import extract
+
+    source = tmp_path / "entry.md"
+    source.write_text("See [[secret]].\n", encoding="utf-8")
+    (tmp_path / "secret.md").write_text("# Secret\n", encoding="utf-8")
+
+    def references(excludes):
+        graph = extract(
+            [source], root=tmp_path, cache_root=tmp_path,
+            parallel=False, extra_excludes=excludes,
+        )
+        return [edge for edge in graph["edges"] if edge["relation"] == "references"]
+
+    assert len(references(None)) == 1
+    assert references(["secret.md"]) == []
+    assert len(references(None)) == 1
+
+
 # ── Groovy ───────────────────────────────────────────────────────────────────
 
 

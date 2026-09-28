@@ -3923,7 +3923,11 @@ def dispatch_command(cmd: str) -> None:
             # graphify-out/ dir into a project that asked for external output.
             # `root` stays the scanned project so source_file/ids relativize
             # against it; conflating the two basenamed every node (#1941).
-            ast_kwargs: dict = {"cache_root": out_root, "root": target}
+            ast_kwargs: dict = {
+                "cache_root": out_root, "root": target,
+                "extra_excludes": _effective_excludes or None,
+                "gitignore": _effective_gitignore,
+            }
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
             # #2437/#2438 (the `graphify update` twin of watch's #2406 fix): an
