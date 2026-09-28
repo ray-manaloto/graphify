@@ -293,6 +293,105 @@ def test_workflow_wrong_pin_refuses_before_apply(tmp_path: Path) -> None:
     assert source_fingerprint(repos["source"]) == before
 
 
+def test_workflow_rejects_candidate_drift_before_index_or_apply(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    plan = tmp_path / "plan.json"
+    assert preview_override(repos, plan).returncode == 0
+    pin = hashlib.sha256(plan.read_bytes()).hexdigest()
+    config, index, output, evidence = workflow_fixture(repos, tmp_path, plan, pin)
+    payload = json.loads(config.read_text())
+    payload["preview"] = {
+        "source_repo": str(repos["source"]), "candidate": repos["base"],
+        "upstream_repository": "Graphify-Labs/graphify", "upstream_url": str(repos["upstream"]),
+        "output_plan": str(plan), "override_sha": repos["target"],
+        "override_reason": "bounded fixture target",
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    before = source_fingerprint(repos["source"])
+
+    refused = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+
+    assert refused.returncode == 2
+    assert "frozen candidate or preview input differs" in json.loads(refused.stderr)["error"]
+    assert not index.exists()
+    assert not output.exists()
+    assert not evidence.exists()
+    assert source_fingerprint(repos["source"]) == before
+    payload["preview"]["candidate"] = repos["candidate"]
+    payload["preview"]["github_releases_fixture"] = str(tmp_path / "unused.json")
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    ambiguous = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert ambiguous.returncode == 2
+    assert "override cannot include release-selection inputs" in json.loads(ambiguous.stderr)["error"]
+    assert not index.exists()
+    assert source_fingerprint(repos["source"]) == before
+
+
+def test_workflow_freezes_release_fixture_bytes_before_apply(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    plan = tmp_path / "plan.json"
+    config, index, output, evidence = workflow_fixture(repos, tmp_path, plan, None)
+    releases = tmp_path / "releases.json"
+    pypi = tmp_path / "pypi.json"
+    releases.write_text(json.dumps({"pages": [[{
+        "tag_name": "v1.1.0", "published_at": "2026-09-28T12:00:00Z",
+        "draft": False, "prerelease": False,
+    }]]}), encoding="utf-8")
+    pypi.write_text(json.dumps({"1.1.0": {"urls": [
+        {"url": "https://files.invalid/graphifyy.whl", "yanked": False}
+    ]}}), encoding="utf-8")
+    payload = json.loads(config.read_text())
+    payload["preview"] = {
+        "source_repo": str(repos["source"]), "candidate": repos["candidate"],
+        "upstream_repository": "Graphify-Labs/graphify", "upstream_url": str(repos["upstream"]),
+        "output_plan": str(plan), "github_releases_fixture": str(releases),
+        "pypi_fixture": str(pypi),
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    started = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert started.returncode != 0, started.stderr
+    assert json.loads(started.stderr)["next_action"] == "supply_external_plan_pin"
+    frozen = json.loads(plan.read_text())
+    assert frozen["selection"]["target_commit"] == repos["target"]
+    assert frozen["selection"]["release"]["tag"] == "v1.1.0"
+    run_id = json.loads(index.read_text())["run_id"]
+    before = source_fingerprint(repos["source"])
+    pypi.write_text(pypi.read_text() + "\n", encoding="utf-8")
+
+    refused = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id,
+                      "--expected-plan-sha256", hashlib.sha256(plan.read_bytes()).hexdigest())
+
+    assert refused.returncode == 2
+    assert "release fixture identity drift" in json.loads(refused.stderr)["error"]
+    assert not output.exists()
+    assert not evidence.exists()
+    assert source_fingerprint(repos["source"]) == before
+
+
+def test_workflow_resume_stops_on_output_that_lost_target_ancestry(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    plan = tmp_path / "plan.json"
+    assert preview_override(repos, plan).returncode == 0
+    pin = hashlib.sha256(plan.read_bytes()).hexdigest()
+    config, index, output, evidence = workflow_fixture(repos, tmp_path, plan, pin)
+    started = run_cli("run", "--workflow-config", str(config), "--evidence-index", str(index))
+    assert started.returncode != 0
+    assert json.loads(started.stderr)["next_action"] == "qualify_capabilities"
+    run_id = json.loads(index.read_text())["run_id"]
+    result_before = (evidence / "result.json").read_bytes()
+    git(output, "reset", "--hard", repos["candidate"])
+    assert git(output, "merge-base", "--is-ancestor", repos["target"], "HEAD", check=False).returncode != 0
+
+    stopped = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
+
+    assert stopped.returncode == 2
+    assert "apply replay refused" in json.loads(stopped.stderr)["error"]
+    replay_failure = json.loads(index.read_text())["replay_failure"]
+    assert replay_failure["direct_rc"] == 2
+    assert (evidence / "result.json").read_bytes() == result_before
+    assert git(output, "rev-parse", "HEAD").stdout.strip() == repos["candidate"]
+
+
 def test_workflow_sidecar_requires_complete_exact_output_binding(tmp_path: Path) -> None:
     repos = make_repositories(tmp_path)
     plan = tmp_path / "plan.json"
@@ -309,15 +408,20 @@ def test_workflow_sidecar_requires_complete_exact_output_binding(tmp_path: Path)
     run_id = json.loads(index.read_text())["run_id"]
     result = json.loads((evidence / "result.json").read_text())
     manifest = json.loads(plan.read_text())["capability_manifest"]
+    capability_evidence = tmp_path / "ticket788-evidence.txt"
+    capability_evidence.write_text("fixture capability review\n", encoding="utf-8")
+    evidence_sha = hashlib.sha256(capability_evidence.read_bytes()).hexdigest()
     payload = {
         "schema_version": 1, "ticket": 788, "plan_sha256": pin,
+        "target_commit": repos["target"],
         "result_commit": repos["candidate"], "result_tree": result["result_tree"],
+        "result_receipt_sha256": hashlib.sha256((evidence / "result.json").read_bytes()).hexdigest(),
         "capabilities": [
             {"path": row["path"], "status": row["status"],
              "classification": "retained", "rationale": "fixture evidence",
-             "evidence_refs": ["fixture://case"]}
+             "evidence_refs": [evidence_sha]}
             for row in manifest
-        ], "evidence_refs": ["fixture://case"],
+        ], "evidence_refs": [{"path": str(capability_evidence), "sha256": evidence_sha}],
     }
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     bad = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
@@ -325,6 +429,13 @@ def test_workflow_sidecar_requires_complete_exact_output_binding(tmp_path: Path)
     assert "does not bind exact plan and output" in json.loads(bad.stderr)["error"]
     assert not json.loads(index.read_text()).get("qualification_sidecar_sha256")
     payload["result_commit"] = result["result_commit"]
+    payload["capabilities"][0]["classification"] = "unknown"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    unknown = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
+    assert unknown.returncode == 2
+    assert "classification is unknown" in json.loads(unknown.stderr)["error"]
+    assert not json.loads(index.read_text()).get("qualification_sidecar_sha256")
+    payload["capabilities"][0]["classification"] = "retained"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     accepted = run_cli("resume", "--evidence-index", str(index), "--run-id", run_id)
     assert accepted.returncode != 0
@@ -332,11 +443,18 @@ def test_workflow_sidecar_requires_complete_exact_output_binding(tmp_path: Path)
     assert json.loads(index.read_text())["qualification_sidecar_sha256"] == hashlib.sha256(
         sidecar.read_bytes()).hexdigest()
     before_status = index.read_bytes()
-    payload["evidence_refs"] = ["fixture://changed"]
+    payload["evidence_refs"] = [{"path": str(capability_evidence), "sha256": "0" * 64}]
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     stale = run_cli("status", "--evidence-index", str(index), "--run-id", run_id)
     assert stale.returncode == 0
     assert json.loads(stale.stdout)["next_action"] == "inspect_sidecar_drift"
+    assert index.read_bytes() == before_status
+    payload["evidence_refs"] = [{"path": str(capability_evidence), "sha256": evidence_sha}]
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    capability_evidence.write_text("drifted evidence\n", encoding="utf-8")
+    stale_ref = run_cli("status", "--evidence-index", str(index), "--run-id", run_id)
+    assert stale_ref.returncode == 0
+    assert json.loads(stale_ref.stdout)["stopped_reason"] == "sidecar_evidence_drift"
     assert index.read_bytes() == before_status
 
 
@@ -497,6 +615,34 @@ def test_preview_selects_by_publication_time_and_does_not_mutate_source(tmp_path
             raw = Path(record[stream]["raw_path"]).read_bytes()
             assert len(raw) == record[stream]["bytes"]
             assert hashlib.sha256(raw).hexdigest() == record[stream]["sha256"]
+    assert source_fingerprint(repos["source"]) == before
+
+
+def test_preview_refuses_ambiguous_stable_publication_tie(tmp_path: Path) -> None:
+    repos = make_repositories(tmp_path)
+    releases_fixture = tmp_path / "releases.json"
+    pypi_fixture = tmp_path / "pypi.json"
+    releases_fixture.write_text(json.dumps({"pages": [[
+        {"tag_name": "v1.1.0", "published_at": "2026-09-28T12:00:00Z",
+         "draft": False, "prerelease": False},
+        {"tag_name": "v1.2.0", "published_at": "2026-09-28T12:00:00Z",
+         "draft": False, "prerelease": False},
+    ]]}), encoding="utf-8")
+    pypi_fixture.write_text(json.dumps({
+        "1.1.0": {"urls": [{"url": "https://files.invalid/a.whl", "yanked": False}]},
+        "1.2.0": {"urls": [{"url": "https://files.invalid/b.whl", "yanked": False}]},
+    }), encoding="utf-8")
+    plan = tmp_path / "plan.json"
+    before = source_fingerprint(repos["source"])
+    refused = run_cli(
+        "preview", "--source-repo", str(repos["source"]), "--candidate", repos["candidate"],
+        "--upstream-repository", "Graphify-Labs/graphify", "--upstream-url", str(repos["upstream"]),
+        "--github-releases-fixture", str(releases_fixture), "--pypi-fixture", str(pypi_fixture),
+        "--output-plan", str(plan),
+    )
+    assert refused.returncode == 2
+    assert "publication time" in json.loads(refused.stderr)["error"]
+    assert not plan.exists()
     assert source_fingerprint(repos["source"]) == before
 
 

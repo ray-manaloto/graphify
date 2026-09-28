@@ -1541,6 +1541,9 @@ def select_release(
         if item.get("draft") is False and item.get("prerelease") is False:
             stable.append((parse_published_at(item.get("published_at")), item))
     stable.sort(key=lambda pair: pair[0], reverse=True)
+    for newer, older in zip(stable, stable[1:]):
+        if newer[0] == older[0] and newer[1].get("tag_name") != older[1].get("tag_name"):
+            raise MaintenanceError("stable releases share publication time; target order is ambiguous")
     observations: list[dict[str, Any]] = []
     for published, item in stable:
         tag = item.get("tag_name")
@@ -3154,6 +3157,19 @@ def workflow_config(value: Any) -> dict[str, Any]:
         if any(not isinstance(v, str) or not v for v in part.values()):
             raise MaintenanceError("workflow arguments must be nonempty strings")
     if preview:
+        require_sha(preview["candidate"], "workflow candidate")
+        if ("override_sha" in preview) != ("override_reason" in preview):
+            raise MaintenanceError("workflow override requires exact SHA and reason together")
+        if "override_sha" in preview:
+            require_sha(preview["override_sha"], "workflow override")
+            if not preview["override_reason"].strip():
+                raise MaintenanceError("workflow override reason must be nonempty")
+            if any(key in preview for key in (
+                "github_releases_url", "github_releases_fixture", "pypi_fixture", "pypi_base_url"
+            )):
+                raise MaintenanceError("workflow override cannot include release-selection inputs")
+        if ("github_releases_fixture" in preview) != ("pypi_fixture" in preview):
+            raise MaintenanceError("workflow release fixtures must be supplied together")
         if Path(preview["output_plan"]).resolve() != Path(apply["plan"]).resolve():
             raise MaintenanceError("preview output and apply plan differ")
         if Path(preview["source_repo"]).resolve() != Path(apply["source_repo"]).resolve():
@@ -3179,6 +3195,82 @@ def workflow_config(value: Any) -> dict[str, Any]:
     if sidecar is not None and (not isinstance(sidecar, str) or not Path(sidecar).is_absolute()):
         raise MaintenanceError("qualification sidecar path must be absolute")
     return value
+
+
+def workflow_fixture_bindings(config: dict[str, Any]) -> dict[str, dict[str, str]]:
+    preview = config.get("preview") or {}
+    bindings: dict[str, dict[str, str]] = {}
+    for key in ("github_releases_fixture", "pypi_fixture"):
+        if key not in preview:
+            continue
+        path = Path(preview[key]).resolve(strict=True)
+        if not path.is_file() or path.stat().st_size > MAX_HTTP_BYTES:
+            raise MaintenanceError(f"workflow {key} is not a bounded regular file")
+        bindings[key] = {"path": str(path), "sha256": sha256_bytes(path.read_bytes())}
+    return bindings
+
+
+def workflow_validate_plan_config(plan: dict[str, Any], config: dict[str, Any]) -> None:
+    apply = config["apply"]
+    if (plan["source_repository"].get("worktree") != str(Path(apply["source_repo"]).resolve()) or
+            plan["upstream_repository"].get("url") != validate_upstream_url(apply["upstream_url"])):
+        raise MaintenanceError("frozen plan source or upstream differs from workflow configuration")
+    preview = config.get("preview")
+    if preview:
+        inputs = plan.get("inputs")
+        if (plan["candidate"]["commit"] != preview["candidate"] or
+                plan["upstream_repository"].get("identity") != preview["upstream_repository"] or
+                not isinstance(inputs, dict) or
+                inputs.get("output_plan") != str(Path(preview["output_plan"]).resolve())):
+            raise MaintenanceError("frozen candidate or preview input differs from workflow configuration")
+        selection = plan["selection"]
+        if "override_sha" in preview:
+            override = selection.get("override")
+            if (selection["mode"] != "override" or not isinstance(override, dict) or
+                    override.get("sha") != preview["override_sha"] or
+                    override.get("reason") != preview["override_reason"]):
+                raise MaintenanceError("frozen override differs from workflow configuration")
+        elif selection["mode"] != "release":
+            raise MaintenanceError("workflow release selection cannot silently become an override")
+        if "github_releases_fixture" in preview:
+            bindings = plan.get("evidence_bindings")
+            release_inputs = bindings.get("release_inputs") if isinstance(bindings, dict) else None
+            github_input = release_inputs.get("github") if isinstance(release_inputs, dict) else None
+            pypi_input = release_inputs.get("pypi") if isinstance(release_inputs, dict) else None
+            if (selection.get("evidence_kind") != "recorded_fixture" or
+                    not isinstance(github_input, dict) or not isinstance(pypi_input, dict) or
+                    github_input.get("canonical_json_sha256") != sha256_bytes(
+                        canonical_json(read_json_file(
+                            Path(preview["github_releases_fixture"]), "release fixture"
+                        ))
+                    ) or
+                    pypi_input.get("canonical_json_sha256") != sha256_bytes(
+                        canonical_json(read_json_file(
+                            Path(preview["pypi_fixture"]), "PyPI fixture"
+                        ))
+                    )):
+                raise MaintenanceError("frozen release evidence differs from workflow fixtures")
+        elif selection["mode"] == "release" and selection.get("evidence_kind") == "recorded_fixture":
+            raise MaintenanceError("recorded fixture selection requires frozen workflow fixtures")
+    selection = plan["selection"]
+    if selection["mode"] == "release":
+        release = selection.get("release")
+        if (not isinstance(release, dict) or
+                not isinstance(release.get("tag"), str) or
+                not isinstance(release.get("version"), str) or
+                version_from_tag(release["tag"]) != release["version"]):
+            raise MaintenanceError("frozen release tag and version are invalid")
+        parse_published_at(release.get("published_at"))
+        if selection.get("override") is not None:
+            raise MaintenanceError("frozen release conflicts with an override")
+        bindings = plan.get("evidence_bindings")
+        observations = bindings.get("release_observations") if isinstance(bindings, dict) else None
+        if (not isinstance(observations, list) or not observations or
+                any(not isinstance(item, dict) for item in observations) or
+                observations[-1].get("tag") != release["tag"] or
+                observations[-1].get("usable") is not True or
+                any(item.get("usable") is True for item in observations[:-1])):
+            raise MaintenanceError("frozen release does not match first usable observation")
 
 
 def workflow_arguments(operation: str, fields: dict[str, str]) -> list[str]:
@@ -3248,6 +3340,8 @@ def workflow_load_index(path: Path, run_id: str) -> dict[str, Any]:
         raise MaintenanceError(f"workflow configuration unavailable: {exc}") from exc
     if sha256_bytes(current_config) != index.get("config_file_sha256"):
         raise MaintenanceError("workflow configuration file drift")
+    if workflow_fixture_bindings(config) != index.get("preview_fixture_bindings", {}):
+        raise MaintenanceError("workflow release fixture identity drift")
     return index
 
 
@@ -3258,6 +3352,30 @@ def workflow_index_bytes(index: dict[str, Any]) -> bytes:
     return json_file_bytes(index)
 
 
+def workflow_evidence_ref(value: Any) -> str:
+    if (not isinstance(value, dict) or set(value) != {"path", "sha256"} or
+            not isinstance(value["path"], str) or not Path(value["path"]).is_absolute() or
+            not isinstance(value["sha256"], str) or not DIGEST_RE.fullmatch(value["sha256"])):
+        raise MaintenanceError("ticket788 evidence reference must bind an absolute file and SHA-256")
+    path = Path(value["path"])
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise MaintenanceError("ticket788 evidence reference is not a regular file")
+        digest = hashlib.sha256()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise MaintenanceError("ticket788 evidence reference changed file type")
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as exc:
+        raise MaintenanceError(f"ticket788 evidence reference cannot be read: {exc}") from exc
+    if digest.hexdigest() != value["sha256"]:
+        raise MaintenanceError("ticket788 evidence reference digest drift")
+    return value["sha256"]
+
+
 def workflow_validate_sidecar(index: dict[str, Any], plan: dict[str, Any]) -> str:
     sidecar_name = index["config"].get("qualification_sidecar")
     if not sidecar_name:
@@ -3266,21 +3384,36 @@ def workflow_validate_sidecar(index: dict[str, Any], plan: dict[str, Any]) -> st
     content = sidecar_path.read_bytes()
     sidecar = json.loads(content)
     if not isinstance(sidecar, dict) or set(sidecar) != {
-        "schema_version", "ticket", "plan_sha256", "result_commit", "result_tree",
+        "schema_version", "ticket", "plan_sha256", "target_commit",
+        "result_commit", "result_tree", "result_receipt_sha256",
         "capabilities", "evidence_refs"
     } or sidecar["schema_version"] != 1 or sidecar["ticket"] != 788:
         raise MaintenanceError("ticket788 sidecar schema is incomplete")
-    result = read_result(Path(index["config"]["apply"]["evidence_dir"]) / "result.json")
+    result_path = Path(index["config"]["apply"]["evidence_dir"]) / "result.json"
+    result = read_result(result_path)
     if (result.get("status") != "applied" or
+            result.get("plan_id") != plan["plan_id"] or
+            result.get("plan_sha256") != index["plan_sha256"] or
+            result.get("ancestry_proved") is not True or
             sidecar["plan_sha256"] != index["plan_sha256"] or
+            sidecar["target_commit"] != plan["selection"]["target_commit"] or
             sidecar["result_commit"] != result.get("result_commit") or
-            sidecar["result_tree"] != result.get("result_tree")):
+            sidecar["result_tree"] != result.get("result_tree") or
+            sidecar["result_receipt_sha256"] != sha256_bytes(result_path.read_bytes())):
         raise MaintenanceError("ticket788 sidecar does not bind exact plan and output")
+    refs = sidecar["evidence_refs"]
+    if not isinstance(refs, list) or not refs:
+        raise MaintenanceError("ticket788 sidecar evidence is incomplete")
+    evidence_digests = {workflow_evidence_ref(ref) for ref in refs}
+    if len(evidence_digests) != len(refs):
+        raise MaintenanceError("ticket788 sidecar evidence is duplicated")
     items = sidecar["capabilities"]
     manifest = plan["capability_manifest"]
     if not isinstance(items, list) or len(items) != len(manifest):
         raise MaintenanceError("ticket788 sidecar capability coverage is incomplete")
     expected = {(item["path"], item["status"]) for item in manifest}
+    if len(expected) != len(manifest):
+        raise MaintenanceError("frozen capability manifest has duplicate identities")
     observed: set[tuple[str, str]] = set()
     for item in items:
         if not isinstance(item, dict) or set(item) != {
@@ -3295,12 +3428,10 @@ def workflow_validate_sidecar(index: dict[str, Any], plan: dict[str, Any]) -> st
             raise MaintenanceError("ticket788 capability classification is unknown")
         if (not isinstance(item["rationale"], str) or not item["rationale"].strip() or
                 not isinstance(item["evidence_refs"], list) or not item["evidence_refs"] or
-                any(not isinstance(ref, str) or not ref for ref in item["evidence_refs"])):
+                any(not isinstance(ref, str) or ref not in evidence_digests
+                    for ref in item["evidence_refs"])):
             raise MaintenanceError("ticket788 capability has no evidence")
-    if (observed != expected or not isinstance(sidecar["evidence_refs"], list) or
-            not sidecar["evidence_refs"] or any(
-                not isinstance(ref, str) or not ref for ref in sidecar["evidence_refs"]
-            )):
+    if observed != expected:
         raise MaintenanceError("ticket788 sidecar evidence is incomplete")
     return sha256_bytes(content)
 
@@ -3410,13 +3541,15 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         plan_path = Path(config["apply"]["plan"])
         pin = config.get("expected_plan_sha256")
         if plan_path.exists() and pin:
-            load_and_validate_plan(plan_path, pin)
+            planned, _ = load_and_validate_plan(plan_path, pin)
+            workflow_validate_plan_config(planned, config)
         if not plan_path.exists() and "preview" not in config:
             raise MaintenanceError("plan absent and preview inputs unavailable")
         index = {"schema_version": WORKFLOW_SCHEMA_VERSION, "run_id": run_id,
                  "config": config, "config_path": str(config_path),
                  "config_file_sha256": sha256_bytes(config_bytes),
                  "immutable_config_sha256": sha256_bytes(canonical_json(config)),
+                 "preview_fixture_bindings": workflow_fixture_bindings(config),
                  "stages": {}, "target_attempts": []}
         exclusive_write_bytes(index_path, workflow_index_bytes(index))
     else:
@@ -3440,6 +3573,14 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             return {"run_id": run_id, "status": "stopped",
                     "next_action": "inspect_sidecar_drift", "stopped_reason": "sidecar_drift",
                     "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
+        if index.get("qualification_sidecar_sha256"):
+            try:
+                frozen_plan, _ = load_and_validate_plan(plan_path, index["plan_sha256"])
+                workflow_validate_sidecar(index, frozen_plan)
+            except MaintenanceError:
+                return {"run_id": run_id, "status": "stopped",
+                        "next_action": "inspect_sidecar_drift", "stopped_reason": "sidecar_evidence_drift",
+                        "stages": index["stages"], "target_attempts": index["target_attempts"]}, 0
         if os.path.lexists(Path(config["apply"]["evidence_dir"]) / "attempt.lock"):
             return {"run_id": run_id, "status": "stopped",
                     "next_action": "inspect_retained_lock", "stopped_reason": "apply_ownership_uncertain",
@@ -3475,6 +3616,8 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             prior_sha = sha256_bytes(index_path.read_bytes())
             if receipt["direct_rc"] != 0 or receipt["status"] != "planned":
                 return {"run_id": run_id, **workflow_project(index, plan_path.exists())}, EXIT_REFUSED
+            if workflow_fixture_bindings(config) != index["preview_fixture_bindings"]:
+                raise MaintenanceError("workflow release fixture drifted during preview")
         pin = getattr(args, "expected_plan_sha256", None) or config.get("expected_plan_sha256")
         if (getattr(args, "expected_plan_sha256", None) and config.get("expected_plan_sha256")
                 and args.expected_plan_sha256 != config["expected_plan_sha256"]):
@@ -3484,6 +3627,7 @@ def workflow_execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if not DIGEST_RE.fullmatch(pin):
             raise MaintenanceError("external plan pin is invalid")
         plan, observed_pin = load_and_validate_plan(plan_path, pin)
+        workflow_validate_plan_config(plan, config)
         if index.get("plan_sha256") not in (None, observed_pin):
             raise MaintenanceError("workflow plan pin changed")
         index["plan_sha256"] = observed_pin
