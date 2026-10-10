@@ -124,12 +124,18 @@ dev = [
     "tree-sitter-hcl>=1.2.0",
     "tree-sitter-ocaml>=0.25.0",
     "tree-sitter-commonlisp>=0.4.1",
+    "httpx2>=2.13.1",
 ]
 
 [tool.uv]
 # Install via: uv tool install graphifyy
 # Run without installing: uvx graphifyy install
 package = true
+# Upstream PR 820 fixes invalid regex escapes in jieba 0.42.1 on Python 3.14.
+# Keep the immutable source repair local to this development environment.
+override-dependencies = [
+    "jieba @ git+https://github.com/fxsjy/jieba@9ad240225ce521400cf2f10c8921ab5e6cbf0a16",
+]
 
 [tool.setuptools]
 packages = ["graphify", "graphify.extractors", "graphify.exporters"]
@@ -146,6 +152,7 @@ graphify = ["skill.md", "skill-codex.md", "skill-opencode.md", "skill-kilo.md", 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = [
+    ".hypothesis", # Generated examples, also excluded by pytest's default ignores.
     "graphify-benchmark", "graphify_eval", "graphify_test",
     "worked", "llm-stack-corpus", "llm-stack-demo", "product-site",
     "scripts", "ebook", ".github", "dist", "build",

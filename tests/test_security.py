@@ -93,8 +93,9 @@ def test_safe_fetch_raises_on_non_2xx():
         mock_opener = MagicMock()
         mock_opener.open.return_value = mock_resp
         mock_opener_fn.return_value = mock_opener
-        with pytest.raises(urllib.error.HTTPError):
+        with pytest.raises(urllib.error.HTTPError) as caught:
             safe_fetch("https://example.com/missing")
+        caught.value.close()
 
 def test_safe_fetch_raises_on_size_exceeded():
     # Build a response larger than max_bytes

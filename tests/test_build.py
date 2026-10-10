@@ -1436,6 +1436,55 @@ def test_graph_has_legacy_ids_detects_old_scheme():
     assert graph_has_legacy_ids(go_symbol, root=".") is False
 
 
+def test_graph_has_legacy_ids_checks_local_id_in_merged_graph():
+    """A repo namespace does not turn a current file ID into an old stem."""
+    from graphify.build import graph_has_legacy_ids
+
+    source_file = "homebrew/firecrawl-cli.rb"
+    current = "homebrew_firecrawl_cli_firecrawlcli"
+    node = {
+        "id": f"firecrawl-cli::{current}",
+        "repo": "firecrawl-cli",
+        "local_id": current,
+        "source_file": source_file,
+        "source_location": "L1",
+    }
+    assert graph_has_legacy_ids([node], root=".") is False
+
+    stale = {**node, "id": "firecrawl-cli::firecrawl_cli", "local_id": "firecrawl_cli"}
+    assert graph_has_legacy_ids([stale], root=".") is True
+
+    nested = {**node, "id": f"outer::{node['id']}", "repo": "outer"}
+    assert graph_has_legacy_ids([nested], root=".") is False
+
+    nested_stale = {**stale, "id": f"outer::{stale['id']}", "repo": "outer"}
+    assert graph_has_legacy_ids([nested_stale], root=".") is True
+
+
+@pytest.mark.parametrize(
+    "invalid_metadata",
+    [
+        {"repo": ""},
+        {"repo": "unrelated"},
+        {"local_id": ""},
+        {"local_id": "unrelated"},
+        {"id": "firecrawl-cli::::homebrew_firecrawl_cli_firecrawlcli"},
+    ],
+)
+def test_graph_has_legacy_ids_does_not_trust_invalid_merge_metadata(invalid_metadata):
+    from graphify.build import graph_has_legacy_ids
+
+    node = {
+        "id": "firecrawl-cli::homebrew_firecrawl_cli_firecrawlcli",
+        "repo": "firecrawl-cli",
+        "local_id": "homebrew_firecrawl_cli_firecrawlcli",
+        "source_file": "homebrew/firecrawl-cli.rb",
+        "source_location": "L1",
+        **invalid_metadata,
+    }
+    assert graph_has_legacy_ids([node], root=".") is True
+
+
 # ── #2408: globally-scoped MCP node ids are not file-stem derived ──────────────
 
 @pytest.mark.parametrize("mcp_kind, nid", [

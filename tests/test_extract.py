@@ -384,10 +384,20 @@ def test_collect_files_from_dir():
     assert len(files) > 0
 
 
-def test_collect_files_skips_hidden():
-    files = collect_files(FIXTURES)
-    for f in files:
-        assert not any(part.startswith(".") for part in f.parts)
+@pytest.mark.parametrize("parent_name", ["ordinary", ".codex"])
+def test_collect_files_skips_noise_relative_to_root(tmp_path, parent_name):
+    root = tmp_path / parent_name / "worktree"
+    root.mkdir(parents=True)
+    (root / "visible.py").write_text("value = 1\n")
+    for name in (".git", ".venv"):
+        noise_dir = root / name
+        noise_dir.mkdir()
+        (noise_dir / "nested.py").write_text("nested = 1\n")
+
+    files = collect_files(root)
+    relative_paths = {f.relative_to(root) for f in files}
+    assert relative_paths == {Path("visible.py")}
+    assert all(not part.startswith(".") for f in relative_paths for part in f.parts)
 
 
 def test_collect_files_follows_symlinked_directory(requires_symlinks, tmp_path):

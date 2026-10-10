@@ -76,7 +76,8 @@ def test_a_clean_file_is_silent(tmp_path, capsys):
 
 def test_the_citation_is_gone_from_the_source_not_just_one_path():
     import graphify.extract as ex
-    text = open(ex.__file__, encoding="utf-8").read()
+    with open(ex.__file__, encoding="utf-8") as source:
+        text = source.read()
     assert "may be partially extracted: {_shown}{_more} (#2551)" not in text
     assert "no symbols extracted" in text
     assert "symbol(s) extracted" in text

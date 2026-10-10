@@ -310,7 +310,9 @@ def test_checkpoint_scopes_cache_writes_to_chunk_files(tmp_path):
             "input_tokens": 1, "output_tokens": 1,
         }
 
-    with patch("graphify.llm.extract_files_direct", side_effect=stray):
+    with patch("graphify.llm.extract_files_direct", side_effect=stray), pytest.warns(
+        RuntimeWarning, match="semantic cache skipped out-of-scope source_file 'B.py'"
+    ):
         extract_corpus_parallel(
             [a], backend="kimi", root=tmp_path,
             token_budget=None, chunk_size=1, max_concurrency=1,
@@ -463,7 +465,9 @@ def test_out_of_scope_nodes_are_dropped_from_merged_result(tmp_path, capsys):
             "input_tokens": 1, "output_tokens": 1,
         }
 
-    with patch("graphify.llm.extract_files_direct", side_effect=stray):
+    with patch("graphify.llm.extract_files_direct", side_effect=stray), pytest.warns(
+        RuntimeWarning, match="semantic cache skipped out-of-scope source_file 'B.py'"
+    ):
         result = extract_corpus_parallel(
             [a, c], backend="kimi", root=tmp_path,
             token_budget=None, chunk_size=2, max_concurrency=1,

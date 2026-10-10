@@ -955,7 +955,7 @@ def _mkG(n):
 def test_to_json_refuses_shrink(tmp_path):
     """#479: refuse to silently overwrite an existing graph with fewer nodes."""
     p = tmp_path / "graph.json"
-    json.dump({"nodes": [{"id": f"n{i}"} for i in range(5)]}, p.open("w"))
+    p.write_text(json.dumps({"nodes": [{"id": f"n{i}"} for i in range(5)]}), encoding="utf-8")
     assert to_json(_mkG(2), {}, str(p), force=False) is False
     assert to_json(_mkG(2), {}, str(p), force=True) is True  # force overrides
 
