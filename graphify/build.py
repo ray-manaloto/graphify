@@ -766,8 +766,11 @@ def graph_has_legacy_ids(nodes: list, root: str | Path | None = None, sample: in
             and local_id
             and len(scoped_parts) >= 2
             and all(scoped_parts)
-            and scoped_parts[0] == repo
-            and scoped_parts[-1] == local_id
+            and nid.startswith(f"{repo}::")
+            and (
+                nid == f"{repo}::{local_id}"
+                or nid[len(repo) + 2:].endswith(f"::{local_id}")
+            )
         ):
             ids_to_check = [local_id]
         elif len(scoped_parts) >= 2:

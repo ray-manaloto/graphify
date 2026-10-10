@@ -152,7 +152,7 @@ graphify = ["skill.md", "skill-codex.md", "skill-opencode.md", "skill-kilo.md", 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = [
-    ".hypothesis", # Generated examples, also excluded by pytest's default ignores.
+    ".hypothesis", # Generated examples are not project tests.
     "graphify-benchmark", "graphify_eval", "graphify_test",
     "worked", "llm-stack-corpus", "llm-stack-demo", "product-site",
     "scripts", "ebook", ".github", "dist", "build",

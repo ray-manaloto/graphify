@@ -1287,8 +1287,8 @@ def dispatch_command(cmd: str) -> None:
                 if _legacy(_raw.get("nodes", [])):
                     print(
                         "[graphify] note: this graph uses the pre-#1504 node-ID scheme; "
-                        "rebuild with `graphify extract --force` to get path-qualified IDs "
-                        "(fixes same-name-file collisions).",
+                        "rebuild with `graphify extract --force` for path-qualified IDs. "
+                        "For merged graphs, re-extract the source repositories and merge again.",
                         file=sys.stderr,
                     )
             except Exception:

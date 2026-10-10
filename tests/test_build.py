@@ -1540,6 +1540,33 @@ def test_graph_has_legacy_ids_preserves_canonical_whole_id_without_verified_meta
     assert graph_has_legacy_ids([node], root=".") is False
 
 
+@pytest.mark.parametrize("local_id, expected", [("docs::guide", False), ("guide", True)])
+@pytest.mark.parametrize("repo_tags", [("repo",), ("repo", "outer")])
+def test_graph_has_legacy_ids_checks_merged_custom_ids(local_id, expected, repo_tags):
+    from graphify.build import graph_has_legacy_ids, prefix_graph_for_global
+
+    graph = nx.Graph()
+    graph.add_node(local_id, source_file="docs/guide.md", source_location="L1")
+    for repo_tag in repo_tags:
+        graph = prefix_graph_for_global(graph, repo_tag)
+    nodes = json_graph.node_link_data(graph, edges="links")["nodes"]
+
+    assert graph_has_legacy_ids(nodes) is expected
+
+
+def test_graph_has_legacy_ids_rejects_overlapping_namespace_metadata():
+    from graphify.build import graph_has_legacy_ids
+
+    node = {
+        "id": "repo::docs::guide",
+        "repo": "repo::docs",
+        "local_id": "docs::guide",
+        "source_file": "docs/guide.md",
+        "source_location": "L1",
+    }
+    assert graph_has_legacy_ids([node]) is True
+
+
 # ── #2408: globally-scoped MCP node ids are not file-stem derived ──────────────
 
 @pytest.mark.parametrize("mcp_kind, nid", [

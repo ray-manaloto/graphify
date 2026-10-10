@@ -384,9 +384,9 @@ def test_collect_files_from_dir():
     assert len(files) > 0
 
 
-@pytest.mark.parametrize("parent_name", ["ordinary", ".codex"])
-def test_collect_files_skips_noise_relative_to_root(tmp_path, parent_name):
-    root = tmp_path / parent_name / "worktree"
+@pytest.mark.parametrize("parent_path", ["ordinary", ".codex/worktrees/example"])
+def test_collect_files_prunes_noise_inside_codex_and_ordinary_checkouts(tmp_path, parent_path):
+    root = tmp_path / parent_path / "project"
     root.mkdir(parents=True)
     (root / "visible.py").write_text("value = 1\n")
     for name in (".git", ".venv"):
@@ -397,7 +397,6 @@ def test_collect_files_skips_noise_relative_to_root(tmp_path, parent_name):
     files = collect_files(root)
     relative_paths = {f.relative_to(root) for f in files}
     assert relative_paths == {Path("visible.py")}
-    assert all(not part.startswith(".") for f in relative_paths for part in f.parts)
 
 
 def test_collect_files_follows_symlinked_directory(requires_symlinks, tmp_path):
