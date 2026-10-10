@@ -1485,6 +1485,61 @@ def test_graph_has_legacy_ids_does_not_trust_invalid_merge_metadata(invalid_meta
     assert graph_has_legacy_ids([node], root=".") is True
 
 
+@pytest.mark.parametrize("namespace", ["firecrawl-cli", "outer::firecrawl-cli"])
+@pytest.mark.parametrize(
+    "invalid_metadata",
+    [
+        {"repo": None},
+        {"repo": ""},
+        {"repo": "unrelated"},
+        {"local_id": None},
+        {"local_id": ""},
+        {"local_id": "unrelated"},
+    ],
+)
+def test_graph_has_legacy_ids_detects_old_suffix_with_invalid_merge_metadata(
+    namespace, invalid_metadata
+):
+    from graphify.build import graph_has_legacy_ids
+
+    node = {
+        "id": f"{namespace}::firecrawl_cli",
+        "repo": namespace.split("::")[0],
+        "local_id": "firecrawl_cli",
+        "source_file": "homebrew/firecrawl-cli.rb",
+        "source_location": "L1",
+        **invalid_metadata,
+    }
+    assert graph_has_legacy_ids([node], root=".") is True
+
+
+@pytest.mark.parametrize("nid", ["opaque::docs_v1_api_readme", "outer::opaque::docs_v1_api_readme", "a.b::C.d"])
+@pytest.mark.parametrize("metadata", [{}, {"repo": "unrelated", "local_id": "unrelated"}])
+def test_graph_has_legacy_ids_requires_old_stem_evidence_for_unverified_namespace(nid, metadata):
+    from graphify.build import graph_has_legacy_ids
+
+    node = {
+        "id": nid,
+        "source_file": "docs/v1/api/README.md",
+        "source_location": "L1",
+        **metadata,
+    }
+    assert graph_has_legacy_ids([node], root=".") is False
+
+
+@pytest.mark.parametrize("metadata", [{}, {"repo": "unrelated", "local_id": "unrelated"}])
+def test_graph_has_legacy_ids_preserves_canonical_whole_id_without_verified_metadata(metadata):
+    from graphify.build import graph_has_legacy_ids
+
+    node = {
+        "id": "docs::guide",
+        "source_file": "docs/guide.md",
+        "source_location": "L1",
+        **metadata,
+    }
+    assert graph_has_legacy_ids([node], root=".") is False
+
+
 # ── #2408: globally-scoped MCP node ids are not file-stem derived ──────────────
 
 @pytest.mark.parametrize("mcp_kind, nid", [

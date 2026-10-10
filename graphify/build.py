@@ -758,6 +758,7 @@ def graph_has_legacy_ids(nodes: list, root: str | Path | None = None, sample: in
         repo = node.get("repo")
         local_id = node.get("local_id")
         scoped_parts = nid.split("::")
+        ids_to_check = [nid]
         if (
             isinstance(repo, str)
             and repo
@@ -768,15 +769,20 @@ def graph_has_legacy_ids(nodes: list, root: str | Path | None = None, sample: in
             and scoped_parts[0] == repo
             and scoped_parts[-1] == local_id
         ):
-            nid = local_id
-        norm = _normalize_id(nid)
-        if norm == new_stem or norm.startswith(new_stem + "_"):
-            checked += 1
-        else:
+            ids_to_check = [local_id]
+        elif len(scoped_parts) >= 2:
+            # Unverified metadata cannot exempt a genuinely old local suffix.
+            # Keep the original check too: accepted graph IDs need not carry
+            # merge metadata, so malformed fields alone do not prove legacy IDs.
+            ids_to_check.append(scoped_parts[-1])
+        for candidate in ids_to_check:
+            norm = _normalize_id(candidate)
+            if norm == new_stem or norm.startswith(new_stem + "_"):
+                break
             for old in _old_file_stems(rel):
                 if old != new_stem and (norm == old or norm.startswith(old + "_")):
                     return True
-            checked += 1
+        checked += 1
         if checked >= sample:
             break
     return False
