@@ -295,14 +295,12 @@ def test_ts_normalizer_scales_linearly_on_large_files():
     each match by scanning every range made extraction quadratic, so `extract`
     spun at 100% CPU in the regex/scan path and never finished.
 
-    Assert on scaling, not absolute wall-clock, so the test is not
-    machine-dependent: doubling the input must not roughly quadruple the time.
-    Measure CPU time (``process_time``), not wall-clock (``perf_counter``): under
-    a busy full-suite run the process is preempted, and wall-clock would count
-    time slices spent scheduled off-CPU — inflating the larger measurement and
-    flaking the ratio. CPU time counts only work actually done, so it isolates
-    the algorithmic scaling regardless of load.
+    Compare growth between two input sizes: doubling the input must not
+    roughly quadruple the time. Process CPU time (``process_time``) excludes
+    time scheduled off-CPU, but still counts garbage collection and work in
+    other threads of this process.
     """
+    import gc
     import time
 
     def build(n: int) -> bytes:
@@ -314,16 +312,25 @@ def test_ts_normalizer_scales_linearly_on_large_files():
 
     def timed(n: int) -> float:
         source = build(n)
-        start = time.process_time()
-        _normalize_ts_import_types(source)
-        return time.process_time() - start
+        # Match timeit's scoped GC isolation: automatic collection must not
+        # distort one sample, and the caller's GC state must be restored.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            start = time.process_time()
+            _normalize_ts_import_types(source)
+            return time.process_time() - start
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
-    timed(200)  # warm the grammar/parser import off the measured path
-    small = min(timed(1000) for _ in range(5))
-    large = min(timed(2000) for _ in range(5))
+    # Larger inputs make the normalizer's work dominate fixed overhead.
+    timed(500)  # warm the grammar/parser import off the measured path
+    small = min(timed(4000) for _ in range(5))
+    large = min(timed(8000) for _ in range(5))
 
-    # Linear work doubles (~2x). Quadratic work quadruples (~4x). A generous
-    # 3x ceiling separates the two without being flaky under load.
+    # Linear work doubles (~2x). Quadratic work quadruples (~4x). Keep the
+    # original 3x ceiling between them.
     assert large < small * 3, (
         f"scaling looks super-linear: {small:.4f}s -> {large:.4f}s "
         f"({large / small:.1f}x for 2x input)"
